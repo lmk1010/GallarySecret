@@ -292,12 +292,17 @@ class PhotoManager {
             return cachedImage
         }
         
+        appLog("缓存未命中，尝试从文件加载: \(filePathString)")
+        
         // 检查文件是否存在
         let fileManager = FileManager.default
-        if !fileManager.fileExists(atPath: imagePath.path) {
-            appLog("文件不存在: \(imagePath.path)")
-            return thumbnailImage
+        guard fileManager.fileExists(atPath: imagePath.path) else {
+            // 修改：添加更明确的日志
+            appLog("错误：文件不存在于路径: \(imagePath.path)")
+            return thumbnailImage // 或者返回 nil，根据业务逻辑决定
         }
+        
+        appLog("文件确认存在: \(imagePath.path)")
         
         var fileSize: UInt64 = 0
         do {
@@ -315,19 +320,17 @@ class PhotoManager {
         
         do {
             // 读取图片数据
-            let data = try Data(contentsOf: imagePath)
+            appLog("尝试读取文件数据: \(imagePath.path)")
+            let data = try Data(contentsOf: imagePath, options: .mappedIfSafe)
             appLog("成功读取图片数据，大小: \(data.count) bytes")
             
             if data.isEmpty {
-                appLog("图片数据为空")
+                appLog("错误：读取到的图片数据为空")
                 return thumbnailImage
             }
             
-            // 推迟图片处理以确保UI渲染管道准备就绪
-            // 这是一个技巧，有时UI渲染需要一点时间准备
-            Thread.sleep(forTimeInterval: 0.05)
-            
             // 使用UIImage初始化
+            appLog("尝试使用 UIImage(data:) 初始化")
             if let image = UIImage(data: data) {
                 appLog("使用UIImage(data:)加载成功")
                 
@@ -344,13 +347,15 @@ class PhotoManager {
             }
             
             // 尝试使用ImageIO框架作为备选方案
+            appLog("尝试使用 ImageIO 初始化")
             var options: [CFString: Any] = [:]
             options[kCGImageSourceShouldCache] = true
             options[kCGImageSourceCreateThumbnailWithTransform] = true
             options[kCGImageSourceCreateThumbnailFromImageAlways] = true
             
+            appLog("ImageIO: 尝试创建 CGImageSource")
             guard let imageSource = CGImageSourceCreateWithData(data as CFData, nil) else {
-                appLog("无法创建图片源")
+                appLog("错误：无法创建图片源 (CGImageSourceCreateWithData 返回 nil)")
                 return thumbnailImage
             }
             
@@ -362,14 +367,13 @@ class PhotoManager {
                 return thumbnailImage
             }
             
-            // 推迟图片处理以确保UI渲染管道准备就绪
-            Thread.sleep(forTimeInterval: 0.05)
-            
+            appLog("ImageIO: 尝试创建 CGImageAtIndex")
             guard let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, options as CFDictionary) else {
-                appLog("无法创建CGImage")
+                appLog("错误：无法创建CGImage (CGImageSourceCreateImageAtIndex 返回 nil)")
                 return thumbnailImage
             }
             
+            appLog("ImageIO: 成功创建 CGImage")
             let fullImage = UIImage(cgImage: cgImage)
             appLog("使用CGImage加载成功，尺寸: \(fullImage.size.width) x \(fullImage.size.height)")
             
@@ -378,8 +382,8 @@ class PhotoManager {
             
             return fullImage
         } catch {
-            appLog("加载原图失败: \(error)")
-            // 如果原图加载失败，返回缩略图作为后备
+            // 修改：记录详细错误
+            appLog("错误：加载原图失败，文件路径: \(imagePath.path), 错误描述: \(error)")
             return thumbnailImage
         }
     }

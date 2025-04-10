@@ -15,9 +15,8 @@ struct PhotoGridView: View {
     @State private var isImporting = false
     @State private var selectedItems = [PhotosPickerItem]()
     @State private var isLoading = false
-    @State private var showingImageDetail = false
-    @State private var selectedPhoto: Photo?
-    @State private var preloadedThumbnails = false // 跟踪是否已预加载
+    @State private var selectedPhoto: Photo? = nil
+    @State private var preloadedThumbnails = false
     
     init(album: Album) {
         self.album = album
@@ -25,48 +24,44 @@ struct PhotoGridView: View {
     }
     
     var body: some View {
-        // 将复杂的 ZStack 拆分为多个视图组件
         ZStack {
-            // 内容视图
             contentView
-            
-            // 加载指示器
             loadingView
         }
         .navigationTitle(updatedAlbum.name)
         .navigationBarItems(trailing: trailingButtons)
         .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
-        // 使用overlay+sheet代替fullScreenCover
-        .sheet(isPresented: $showingImageDetail, onDismiss: {
-            appLog("照片详情视图已关闭")
-        }) {
-            if let photo = selectedPhoto, let index = photos.firstIndex(where: { $0.id == photo.id }) {
-                // 使用NavigationView包装以确保模态状态正确
-                NavigationView {
-                    ImageDetailView(
-                        currentPhoto: photo,
-                        photoIndex: index,
-                        allPhotos: photos,
-                        onDelete: { photoToDelete in
-                            if let indexToDelete = photos.firstIndex(where: { $0.id == photoToDelete.id }) {
-                                photos.remove(at: indexToDelete)
-                                loadPhotos()
+        .fullScreenCover(item: $selectedPhoto, onDismiss: {
+            appLog("照片详情视图已关闭 (item dismissed)")
+        }) { photo in
+            if let index = photos.firstIndex(where: { $0.id == photo.id }) {
+                let _ = appLog("fullScreenCover(item:): Creating ImageDetailView for \(photo.fileName) at index \(index)")
+                ImageDetailView(
+                    currentPhoto: photo,
+                    photoIndex: index,
+                    allPhotos: photos,
+                    onDelete: { photoToDelete in
+                        if let indexToDelete = photos.firstIndex(where: { $0.id == photoToDelete.id }) {
+                            photos.remove(at: indexToDelete)
+                            loadPhotos()
+                            if photos.isEmpty || selectedPhoto?.id == photoToDelete.id {
+                                selectedPhoto = nil
                             }
                         }
-                    )
-                    .navigationBarHidden(true)
-                    .statusBar(hidden: true)
-                    .onAppear {
-                        appLog("图片详情页出现 - 从Sheet")
                     }
+                )
+                .onAppear {
+                    appLog("ImageDetailView appeared via fullScreenCover(item:)")
                 }
                 .ignoresSafeArea()
+            } else {
+                let _ = appLog("fullScreenCover(item:): Error - Could not find index for presented photo \(photo.fileName)")
+                EmptyView()
             }
         }
         .onAppear {
             appLog("PhotoGridView onAppear - 开始加载照片")
             loadPhotos()
-            // 预加载第一张缩略图以避免渲染延迟
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 preloadThumbnails()
             }
@@ -137,12 +132,9 @@ struct PhotoGridView: View {
                 ForEach(photos) { photo in
                     Button(action: {
                         appLog("用户点击缩略图: \(photo.fileName)")
-                        selectedPhoto = photo
                         
-                        // 先设置选中的照片，然后延迟一点点时间再显示详情视图
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            showingImageDetail = true
-                        }
+                        selectedPhoto = photo
+                        appLog("Button Action: Set selectedPhoto to \(photo.fileName) to trigger cover")
                     }) {
                         photoThumbnailView(for: photo)
                     }
@@ -267,6 +259,9 @@ struct PhotoGridView: View {
         if PhotoManager.shared.deletePhoto(photo) {
             if let index = photos.firstIndex(where: { $0.id == photo.id }) {
                 photos.remove(at: index)
+                if selectedPhoto?.id == photo.id {
+                    selectedPhoto = nil
+                }
                 loadPhotos()
             }
         }
@@ -296,37 +291,25 @@ struct ImageDetailView: View {
     @State private var lastOffset = CGSize.zero
     @State private var showingDeleteAlert = false
     @State private var showingControls = true
-    @State private var fullImage: UIImage?
-    @State private var isLoading = true
     @State private var viewHasAppeared = false
     @State private var renderCount = 0
     @State private var currentIndex: Int
     @State private var draggingOffset: CGFloat = 0
     
-    // 添加初始化后启动图片加载
     init(currentPhoto: Photo, photoIndex: Int, allPhotos: [Photo], onDelete: @escaping (Photo) -> Void) {
         self.currentPhoto = currentPhoto
         self.photoIndex = photoIndex
         self.allPhotos = allPhotos
         self.onDelete = onDelete
         _currentIndex = State(initialValue: photoIndex)
-        
-        // 立即开始加载原图
-        appLog("ImageDetailView初始化 - 立即开始加载图片: \(currentPhoto.fileName)")
-        DispatchQueue.global(qos: .userInitiated).async {
-            _ = PhotoManager.shared.loadFullImage(for: currentPhoto)
-        }
     }
     
     var body: some View {
-        // 使用更简单直接的结构 - 减少嵌套
         GeometryReader { geometry in
             ZStack {
-                // 始终保持黑色背景
                 Color.black.edgesIgnoringSafeArea(.all)
                 
                 if scale <= 1.0 {
-                    // 使用TabView实现滑动
                     TabView(selection: $currentIndex) {
                         ForEach(0..<allPhotos.count, id: \.self) { index in
                             SingleImageView(
@@ -338,23 +321,22 @@ struct ImageDetailView: View {
                                 isCurrentView: index == currentIndex
                             )
                             .tag(index)
+                            .id("tabview-item-\(index)-\(renderCount)")
                         }
                     }
                     .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
+                    .id("tab-view-\(currentIndex)-\(renderCount)")
                     .onChange(of: currentIndex) { newIndex in
-                        // 切换到新图片时重置状态
                         scale = 1.0
                         offset = .zero
                         lastOffset = .zero
+                        renderCount += 1
                         appLog("切换到图片 \(allPhotos[newIndex].fileName)")
-                        
-                        // 预加载当前图片
                         DispatchQueue.global(qos: .userInitiated).async {
                             _ = PhotoManager.shared.loadFullImage(for: allPhotos[newIndex])
                         }
                     }
                 } else {
-                    // 在缩放模式下直接显示当前图片
                     SingleImageView(
                         photo: allPhotos[currentIndex],
                         scale: $scale,
@@ -363,6 +345,7 @@ struct ImageDetailView: View {
                         lastOffset: $lastOffset,
                         isCurrentView: true
                     )
+                    .id("zoomed-view-\(currentIndex)-\(renderCount)")
                 }
                 
                 // 控制栏
@@ -411,7 +394,6 @@ struct ImageDetailView: View {
                         
                         Spacer()
                         
-                        // 添加图片索引指示器
                         HStack(spacing: 6) {
                             ForEach(0..<min(allPhotos.count, 9), id: \.self) { i in
                                 Circle()
@@ -458,8 +440,6 @@ struct ImageDetailView: View {
                 primaryButton: .destructive(Text("删除")) {
                     let photoToDelete = allPhotos[currentIndex]
                     onDelete(photoToDelete)
-                    
-                    // 如果这是最后一张图片，关闭视图
                     if allPhotos.count <= 1 {
                         presentationMode.wrappedValue.dismiss()
                     }
@@ -469,20 +449,13 @@ struct ImageDetailView: View {
         }
         .onAppear {
             appLog("ImageDetailView生命周期 - onAppear - 开始")
-            
-            // 立即刷新UI以显示缩略图
-            DispatchQueue.main.async {
-                renderCount += 1
-                viewHasAppeared = true
-                appLog("视图已经出现，设置标志")
-                
-                // 预加载前后图片
-                preloadAdjacentImages()
-            }
+        }
+        .task {
+            appLog("ImageDetailView开始task预加载相邻图片")
+            preloadAdjacentImages()
         }
     }
     
-    // 预加载相邻图片
     private func preloadAdjacentImages() {
         let indices = [
             max(0, currentIndex - 1),
@@ -498,19 +471,15 @@ struct ImageDetailView: View {
         }
     }
     
-    // 分享图片
     private func shareImage() {
         let photo = allPhotos[currentIndex]
         let imageToShare: UIImage
-        
         if let loadedImage = PhotoManager.shared.loadFullImage(for: photo) {
             imageToShare = loadedImage
         } else {
             imageToShare = photo.thumbnailImage
         }
-        
         let activityVC = UIActivityViewController(activityItems: [imageToShare], applicationActivities: nil)
-        
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
            let window = windowScene.windows.first,
            let rootViewController = window.rootViewController {
@@ -519,7 +488,6 @@ struct ImageDetailView: View {
         }
     }
     
-    // 获取顶部安全区域高度
     private func getSafeAreaTop() -> CGFloat {
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
            let window = windowScene.windows.first {
@@ -538,59 +506,110 @@ struct SingleImageView: View {
     @Binding var lastOffset: CGSize
     let isCurrentView: Bool
     
-    @State private var fullImage: UIImage?
-    @State private var isLoading = true
+    @State private var fullImage: UIImage? = nil
+    @State private var isLoading: Bool = false
     @State private var renderCount = 0
     
+    init(photo: Photo, scale: Binding<CGFloat>, offset: Binding<CGSize>, lastScale: Binding<CGFloat>, lastOffset: Binding<CGSize>, isCurrentView: Bool) {
+        self.photo = photo
+        self._scale = scale
+        self._offset = offset
+        self._lastScale = lastScale
+        self._lastOffset = lastOffset
+        self.isCurrentView = isCurrentView
+        appLog("SingleImageView init: \(photo.fileName), isCurrent: \(isCurrentView)")
+    }
+    
     var body: some View {
-        ZStack {
-            // 显示图片
-            let displayImage = fullImage ?? photo.thumbnailImage
+        // 添加日志：检查 displayImage
+        let displayImage = fullImage ?? photo.thumbnailImage
+        let _ = appLog("SingleImageView body: \(photo.fileName), isCurrent: \(isCurrentView), fullImage is nil: \(fullImage == nil), displayImage size: \(displayImage.size)")
+        
+        return ZStack {
             Image(uiImage: displayImage)
                 .resizable()
                 .interpolation(.high)
                 .scaledToFit()
                 .scaleEffect(scale)
                 .offset(offset)
-                .id("image-\(renderCount)")
-                // 组合手势，确保正确的顺序和优先级
+                .id("image-\(renderCount)-\(isCurrentView ? "current" : "other")")
                 .simultaneousGesture(isCurrentView ? doubleTapGesture : nil)
                 .simultaneousGesture(isCurrentView ? magnificationGesture : nil)
                 .simultaneousGesture(isCurrentView && scale > 1.0 ? dragGesture : nil, including: scale > 1.0 ? .all : .subviews)
             
-            // 加载指示器
-            if isLoading && fullImage == nil {
+            if isLoading {
                 ProgressView()
                     .scaleEffect(1.5)
                     .foregroundColor(.white)
             }
         }
-        .onAppear {
-            appLog("单张图片视图出现: \(photo.fileName)")
-            loadFullSizeImage()
+        .task(id: photo.id) { 
+            // 添加日志： .task 开始
+            appLog("SingleImageView .task: \(photo.fileName), isCurrent: \(isCurrentView), fullImage is nil: \(fullImage == nil) - Task started")
+            
+            if isCurrentView && fullImage == nil {
+                // 添加日志： 条件满足，准备调用 loadFullSizeImage
+                appLog("SingleImageView .task: \(photo.fileName) - Condition met, calling loadFullSizeImage")
+                await loadFullSizeImage()
+                // 添加日志： loadFullSizeImage 调用完成
+                appLog("SingleImageView .task: \(photo.fileName) - loadFullSizeImage returned")
+            } else {
+                // 添加日志： 条件不满足
+                appLog("SingleImageView .task: \(photo.fileName) - Condition NOT met (isCurrent: \(isCurrentView), fullImage is nil: \(fullImage == nil))")
+            }
+        }
+        .onChange(of: isCurrentView) { becameCurrent in
+            // 添加日志： isCurrentView 变化
+            appLog("SingleImageView onChange(isCurrentView): \(photo.fileName), becameCurrent: \(becameCurrent), fullImage is nil: \(fullImage == nil)")
+            if becameCurrent && fullImage == nil {
+                Task { 
+                    appLog("SingleImageView onChange(isCurrentView): \(photo.fileName) - Condition met, calling loadFullSizeImage")
+                    await loadFullSizeImage()
+                    appLog("SingleImageView onChange(isCurrentView): \(photo.fileName) - loadFullSizeImage returned")
+                }
+            }
         }
     }
     
-    // 加载全尺寸图片
-    private func loadFullSizeImage() {
-        isLoading = true
+    private func loadFullSizeImage() async {
+        // 添加日志： loadFullSizeImage 开始
+        appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Function start")
         
-        DispatchQueue.global(qos: .userInitiated).async {
-            appLog("加载原图: \(photo.fileName)")
-            
-            if let image = PhotoManager.shared.loadFullImage(for: photo) {
-                DispatchQueue.main.async {
-                    appLog("原图加载完成: \(photo.fileName)")
-                    self.fullImage = image
-                    self.isLoading = false
-                    self.renderCount += 1
-                }
+        await MainActor.run { 
+            if self.fullImage == nil { 
+                 appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Setting isLoading = true")
+                 self.isLoading = true
+                 self.renderCount += 1
             } else {
-                DispatchQueue.main.async {
-                    appLog("原图加载失败: \(photo.fileName)")
-                    self.isLoading = false
-                }
+                 appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - fullImage already exists, not setting isLoading")
             }
+        }
+        
+        appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Starting Task.detached for PhotoManager")
+        
+        let loadedImage = await Task.detached(priority: .userInitiated) { () -> UIImage? in
+            // 添加日志： Task.detached 开始调用 PhotoManager
+            appLog("SingleImageView loadFullSizeImage (Task.detached): \(photo.fileName) - Calling PhotoManager.loadFullImage")
+            let result = PhotoManager.shared.loadFullImage(for: photo)
+            // 添加日志： Task.detached 完成调用 PhotoManager
+            appLog("SingleImageView loadFullSizeImage (Task.detached): \(photo.fileName) - PhotoManager.loadFullImage returned \(result == nil ? "nil" : "image")")
+            return result
+        }.value
+        
+        appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Task.detached finished, preparing MainActor update")
+        
+        await MainActor.run { 
+            appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - Updating state")
+            if let image = loadedImage {
+                appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - Success, setting fullImage")
+                self.fullImage = image
+            } else {
+                appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - Failed to load image")
+            }
+            self.isLoading = false
+            self.renderCount += 1
+            // 添加日志： 状态更新完成
+            appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - State update complete, fullImage is nil: \(self.fullImage == nil), isLoading: \(self.isLoading)")
         }
     }
     
@@ -600,10 +619,20 @@ struct SingleImageView: View {
             .onChanged { value in
                 let delta = value / lastScale
                 lastScale = value
-                scale = min(max(scale * delta, 1), 5)
+                // 限制缩放范围
+                let newScale = scale * delta
+                scale = min(max(newScale, 0.8), 5) // 允许缩小一点
             }
             .onEnded { _ in
                 lastScale = 1.0
+                // 如果缩放小于1，弹回1
+                if scale < 1.0 {
+                    withAnimation {
+                        scale = 1.0
+                        offset = .zero
+                        lastOffset = .zero
+                    }
+                }
             }
     }
     
@@ -612,26 +641,29 @@ struct SingleImageView: View {
             .onChanged { value in
                 if scale > 1 {
                     offset = CGSize(
-                        width: lastOffset.width + value.translation.width,
-                        height: lastOffset.height + value.translation.height
+                        width: lastOffset.width + value.translation.width / scale, // 根据缩放调整拖动
+                        height: lastOffset.height + value.translation.height / scale
                     )
                 }
             }
-            .onEnded { _ in
+            .onEnded { value in
                 lastOffset = offset
+                // 添加边界检查，防止图片拖出屏幕太多 (可选)
+                // ... 边界检查逻辑 ...
             }
     }
     
     private var doubleTapGesture: some Gesture {
         TapGesture(count: 2)
-            .onEnded {
+            .onEnded { 
                 withAnimation(.spring()) {
                     if scale > 1.0 {
                         scale = 1.0
                         offset = .zero
                         lastOffset = .zero
                     } else {
-                        scale = 2.5
+                        // 双击放大到固定倍数或适应屏幕
+                        scale = 2.5 
                     }
                 }
             }
@@ -649,10 +681,8 @@ extension View {
                     
                     if abs(horizontalAmount) > abs(verticalAmount) {
                         if horizontalAmount < 0 {
-                            // 左滑
                             onSwipeLeft()
                         } else {
-                            // 右滑
                             onSwipeRight()
                         }
                     }
