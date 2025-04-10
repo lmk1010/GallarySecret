@@ -91,7 +91,7 @@ struct CalculatorView: View {
     var body: some View {
         ZStack {
             if isAuthenticated {
-                AlbumView()
+                MainView()
                     .transition(.opacity.combined(with: .scale))
             } else {
                 Color.black.edgesIgnoringSafeArea(.all)
