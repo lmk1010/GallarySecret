@@ -8,6 +8,7 @@
 
 /* Begin PBXFileReference section */
 		AE5C6EE52DA7E655000D14CA /* GallarySecret.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = GallarySecret.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AE5C6EFD2DA7F485000D14CA /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -33,6 +34,7 @@
 			isa = PBXGroup;
 			children = (
 				AE5C6EE72DA7E655000D14CA /* GallarySecret */,
+				AE5C6EFC2DA7F485000D14CA /* Frameworks */,
 				AE5C6EE62DA7E655000D14CA /* Products */,
 			);
 			sourceTree = "<group>";
@@ -43,6 +45,14 @@
 				AE5C6EE52DA7E655000D14CA /* GallarySecret.app */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		AE5C6EFC2DA7F485000D14CA /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				AE5C6EFD2DA7F485000D14CA /* libsqlite3.tbd */,
+			);
+			name = Frameworks;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -255,6 +265,7 @@
 				DEVELOPMENT_TEAM = 24D88Q3K3S;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "需要访问您的相册来导入照片到私密相册";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -284,6 +295,7 @@
 				DEVELOPMENT_TEAM = 24D88Q3K3S;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "需要访问您的相册来导入照片到私密相册";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

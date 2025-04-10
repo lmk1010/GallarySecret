@@ -24,8 +24,10 @@ struct MainView: View {
 }
 
 struct AlbumsListView: View {
-    @State private var albums: [Album] = sampleAlbums
+    @State private var albums: [Album] = []
     @State private var showingCreateSheet = false
+    @State private var showingDeleteAlert = false
+    @State private var albumToDelete: Album?
     @Environment(\.colorScheme) var colorScheme
     
     var body: some View {
@@ -63,11 +65,46 @@ struct AlbumsListView: View {
                     .padding(.top)
                     
                     // 相册列表
-                    ForEach(albums) { album in
-                        NavigationLink(destination: PhotoGridView(album: album)) {
-                            AlbumCard(album: album)
+                    if albums.isEmpty {
+                        VStack(spacing: 20) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 50))
+                                .foregroundColor(.gray)
+                            
+                            Text("还没有相册")
+                                .font(.headline)
+                                .foregroundColor(.gray)
+                            
+                            Text("点击顶部的"+"按钮创建一个新相册")
+                                .font(.subheadline)
+                                .foregroundColor(.gray)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal)
                         }
-                        .buttonStyle(PlainButtonStyle())
+                        .padding(.top, 50)
+                    } else {
+                        ForEach(albums) { album in
+                            ZStack {
+                                NavigationLink(destination: PhotoGridView(album: album)) {
+                                    AlbumCard(album: album)
+                                }
+                                .buttonStyle(PlainButtonStyle())
+                            }
+                            .contextMenu {
+                                Button(action: {
+                                    deleteAlbum(album)
+                                }) {
+                                    Label("删除相册", systemImage: "trash")
+                                }
+                            }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    deleteAlbum(album)
+                                } label: {
+                                    Label("删除", systemImage: "trash")
+                                }
+                            }
+                        }
                     }
                 }
                 .padding(.vertical)
@@ -81,19 +118,62 @@ struct AlbumsListView: View {
                 }
             )
             .sheet(isPresented: $showingCreateSheet) {
-                CreateAlbumView(albums: $albums)
+                CreateAlbumView(onAlbumCreated: { newAlbum in
+                    self.albums.insert(newAlbum, at: 0)
+                })
             }
             .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
+            .onAppear {
+                // 从数据库加载相册
+                self.albums = DatabaseManager.shared.getAllAlbums()
+            }
+            .alert(isPresented: $showingDeleteAlert) {
+                Alert(
+                    title: Text("删除相册"),
+                    message: Text("确定要删除相册\"\(albumToDelete?.name ?? "")\"吗？此操作不可恢复。"),
+                    primaryButton: .destructive(Text("删除")) {
+                        if let album = albumToDelete {
+                            performDelete(album)
+                        }
+                    },
+                    secondaryButton: .cancel(Text("取消"))
+                )
+            }
+        }
+    }
+    
+    // 删除相册
+    private func deleteAlbum(_ album: Album) {
+        self.albumToDelete = album
+        self.showingDeleteAlert = true
+    }
+    
+    // 执行删除操作
+    private func performDelete(_ album: Album) {
+        // 从数据库中删除
+        if DatabaseManager.shared.deleteAlbum(id: album.id) {
+            // 更新UI
+            if let index = albums.firstIndex(where: { $0.id == album.id }) {
+                albums.remove(at: index)
+            }
         }
     }
 }
 
 struct Album: Identifiable {
-    let id = UUID()
+    let id: UUID
     let name: String
     let coverImage: String
     let count: Int
     let createdAt: Date
+    
+    init(id: UUID = UUID(), name: String, coverImage: String, count: Int, createdAt: Date) {
+        self.id = id
+        self.name = name
+        self.coverImage = coverImage
+        self.count = count
+        self.createdAt = createdAt
+    }
 }
 
 struct AlbumCard: View {
@@ -167,50 +247,9 @@ struct AlbumCard: View {
     }
 }
 
-struct PhotoGridView: View {
-    let album: Album
-    @State private var gridLayout = [GridItem(.adaptive(minimum: 100))]
-    @Environment(\.colorScheme) var colorScheme
-    
-    var body: some View {
-        ScrollView {
-            LazyVGrid(columns: gridLayout, spacing: 10) {
-                ForEach(0..<(album.count == 0 ? 9 : album.count), id: \.self) { _ in
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(colorScheme == .dark ? 
-                                  Color(UIColor.systemGray5) : Color.gray.opacity(0.2))
-                            .aspectRatio(1, contentMode: .fit)
-                        
-                        Image(systemName: "photo")
-                            .font(.system(size: 30))
-                            .foregroundColor(colorScheme == .dark ? Color.gray.opacity(0.7) : .gray)
-                    }
-                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.2 : 0.05), 
-                            radius: 2, x: 0, y: 1)
-                }
-            }
-            .padding()
-        }
-        .navigationTitle(album.name)
-        .navigationBarItems(trailing:
-            HStack {
-                Button(action: {}) {
-                    Image(systemName: "square.and.arrow.up")
-                }
-                
-                Button(action: {}) {
-                    Image(systemName: "plus")
-                }
-            }
-        )
-        .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
-    }
-}
-
 struct CreateAlbumView: View {
     @Environment(\.presentationMode) var presentationMode
-    @Binding var albums: [Album]
+    var onAlbumCreated: (Album) -> Void
     @State private var albumName = ""
     
     var body: some View {
@@ -233,8 +272,12 @@ struct CreateAlbumView: View {
                             count: 0,
                             createdAt: Date()
                         )
-                        albums.append(newAlbum)
-                        presentationMode.wrappedValue.dismiss()
+                        
+                        // 保存到数据库
+                        if DatabaseManager.shared.saveAlbum(newAlbum) {
+                            onAlbumCreated(newAlbum)
+                            presentationMode.wrappedValue.dismiss()
+                        }
                     }
                 }
                 .disabled(albumName.isEmpty)
@@ -303,28 +346,6 @@ struct ProfileView: View {
         }
     }
 }
-
-// 示例数据
-let sampleAlbums = [
-    Album(
-        name: "生活记忆",
-        coverImage: "",
-        count: 24,
-        createdAt: Date().addingTimeInterval(-86400 * 7)
-    ),
-    Album(
-        name: "旅行",
-        coverImage: "",
-        count: 56,
-        createdAt: Date().addingTimeInterval(-86400 * 30)
-    ),
-    Album(
-        name: "工作",
-        coverImage: "",
-        count: 12,
-        createdAt: Date().addingTimeInterval(-86400 * 2)
-    )
-]
 
 #Preview {
     MainView()
