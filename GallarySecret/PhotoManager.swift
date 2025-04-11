@@ -4,6 +4,12 @@ import Photos
 import ImageIO
 import CoreGraphics
 
+// MARK: - Notification Names
+extension Notification.Name {
+    static let didUpdateAlbumList = Notification.Name("didUpdateAlbumListNotification")
+    static let willReturnToAlbumList = Notification.Name("willReturnToAlbumListNotification")
+}
+
 // 照片模型
 struct Photo: Identifiable {
     let id: UUID
@@ -87,7 +93,7 @@ class PhotoManager {
     }
 
     // 保存照片到相册 (返回 Photo 元数据，预缓存缩略图)
-    func savePhoto(image: UIImage, toAlbum albumId: UUID) -> Photo? {
+    func savePhoto(image: UIImage, toAlbum albumId: UUID, originalFileName: String? = nil, dateTaken: Date? = nil) -> Photo? {
          appLog("PhotoManager: 开始保存照片到相册: \(albumId)") // 添加日志标识
 
         guard let albumDirectory = getAlbumDirectory(for: albumId) else {
@@ -97,7 +103,16 @@ class PhotoManager {
 
         // 使用 UUID 作为文件名
         let photoId = UUID()
-        let fileName = "\(photoId.uuidString).jpg"
+        let fileName: String
+        
+        if let originalName = originalFileName, !originalName.isEmpty {
+            // 可以选择保留原始文件名或添加UUID前缀确保唯一性
+            fileName = "\(photoId.uuidString)_\(originalName)"
+            appLog("PhotoManager: 使用原始文件名: \(originalName)")
+        } else {
+            fileName = "\(photoId.uuidString).jpg"
+        }
+        
         let fileURL = albumDirectory.appendingPathComponent(fileName)
 
          appLog("PhotoManager: 保存照片到路径: \(fileURL.path)")
@@ -110,7 +125,7 @@ class PhotoManager {
         }
 
         // 保存原图 - 使用后台队列避免阻塞
-        // 使用 1.0 保证质量，但对于非常大的图片可能需要考虑压缩
+        // 使用 1.0 保证质量，但对于非常大的图片可能需要考虑压缩，同时保留EXIF信息
         guard let imageData = image.jpegData(compressionQuality: 1.0) else {
              appLog("PhotoManager: 转换图片为JPEG数据失败")
             return nil
@@ -120,18 +135,50 @@ class PhotoManager {
 
         do {
             // 在后台线程写入文件，避免阻塞主线程 (如果图片很大)
-            // 注意：这里简化处理，实际可能需要更复杂的队列管理
-             try imageData.write(to: fileURL, options: .atomic) // 使用 atomic 保证写入完整性
+            try imageData.write(to: fileURL, options: .atomic) // 使用 atomic 保证写入完整性
 
             // 验证文件是否成功写入... (可以按需添加)
              appLog("PhotoManager: 文件成功写入: \(fileName)")
 
-            // 创建照片模型 (仅元数据)
+            // 使用传入的拍摄日期或从EXIF提取的日期
+            var creationDate = dateTaken ?? Date()
+            
+            // 如果没有传入拍摄日期，尝试从EXIF数据中提取
+            if dateTaken == nil {
+                if let source = CGImageSourceCreateWithData(imageData as CFData, nil) {
+                    if let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any] {
+                        // 先尝试从EXIF中获取拍摄时间
+                        if let exif = properties["{Exif}"] as? [String: Any],
+                           let dateTimeOriginal = exif["DateTimeOriginal"] as? String {
+                            let formatter = DateFormatter()
+                            formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+                            if let date = formatter.date(from: dateTimeOriginal) {
+                                creationDate = date
+                                appLog("PhotoManager: 从EXIF中提取到照片拍摄时间: \(dateTimeOriginal)")
+                            }
+                        }
+                        // 如果EXIF没有拍摄时间，尝试从TIFF中获取
+                        else if let tiff = properties["{TIFF}"] as? [String: Any],
+                                let dateTime = tiff["DateTime"] as? String {
+                            let formatter = DateFormatter()
+                            formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+                            if let date = formatter.date(from: dateTime) {
+                                creationDate = date
+                                appLog("PhotoManager: 从TIFF中提取到照片拍摄时间: \(dateTime)")
+                            }
+                        }
+                    }
+                }
+            } else {
+                appLog("PhotoManager: 使用传入的拍摄时间: \(creationDate)")
+            }
+
+            // 创建照片模型 (使用提取的拍摄时间)
             let photo = Photo(
                 id: photoId, // 使用生成的 UUID
                 albumId: albumId,
                 fileName: fileName,
-                createdAt: Date()
+                createdAt: creationDate // 使用提取的拍摄时间
             )
 
             // 将刚创建的缩略图存入缓存
@@ -141,9 +188,10 @@ class PhotoManager {
             imageCache.setObject(thumbnailImage, forKey: cacheKey, cost: cost)
              appLog("PhotoManager: 预缓存缩略图: \(fileName), cost: \(cost)")
 
-
+            appLog("PhotoManager: Preparing to call updateAlbumPhotoCount for album \(albumId)")
             // 更新相册照片数量
             updateAlbumPhotoCount(albumId: albumId, change: 1)
+            appLog("PhotoManager: Returned from updateAlbumPhotoCount for album \(albumId)")
 
              appLog("PhotoManager: 照片元数据保存成功: \(fileName)")
             return photo // 返回元数据 Photo
@@ -236,29 +284,39 @@ class PhotoManager {
     // 更新相册照片数量 (直接修改数据库)
     private func updateAlbumPhotoCount(albumId: UUID, change: Int) {
          appLog("PhotoManager: updateAlbumPhotoCount for album \(albumId) by \(change)")
-        // 直接修改数据库中的计数值，避免重新扫描文件系统
-        DispatchQueue.global(qos: .utility).async { // 在后台更新数据库
-             // 1. 获取所有相册
-             let allAlbums = DatabaseManager.shared.getAllAlbums()
-             
-             // 2. 查找需要更新的相册
-             if var albumToUpdate = allAlbums.first(where: { $0.id == albumId }) {
-                 // 3. 计算新数量并更新相册对象
-                 let newCount = max(0, albumToUpdate.count + change) // 确保不为负
-                 albumToUpdate.count = newCount
-                 
-                 // 4. 将更新后的相册写回数据库
-                 if DatabaseManager.shared.updateAlbum(albumToUpdate) {
-                      appLog("PhotoManager: Successfully updated album count in DB to \(newCount) for \(albumId)")
-                 } else {
-                      appLog("PhotoManager: Failed to update album count in DB for \(albumId)")
-                 }
-             } else {
-                  // 如果没有找到相册，记录日志
-                  appLog("PhotoManager: updateAlbumPhotoCount - Could not find album with id \(albumId) in DB to update count.")
-             }
-             // 注意：当前 DatabaseManager.getAllAlbums() 实现似乎不会抛出错误，所以未添加 try/catch
+        // 移除后台调度，数据库操作本身可能很快，或者 DatabaseManager 内部处理线程
+        // DispatchQueue.global(qos: .utility).async { 
+        
+        // 1. 获取所有相册
+        let allAlbums = DatabaseManager.shared.getAllAlbums()
+        
+        // 2. 查找需要更新的相册
+        if var albumToUpdate = allAlbums.first(where: { $0.id == albumId }) {
+            appLog("PhotoManager: Found album '\(albumToUpdate.name)' in DB to update count.")
+            // 3. 计算新数量并更新相册对象
+            let newCount = max(0, albumToUpdate.count + change) // 确保不为负
+            albumToUpdate.count = newCount
+            
+            // 4. 将更新后的相册写回数据库
+            appLog("PhotoManager: Attempting to update album count in DB for \(albumId) to \(newCount)")
+            let updateSuccess = DatabaseManager.shared.updateAlbum(albumToUpdate)
+            appLog("PhotoManager: DB update result for \(albumId): \(updateSuccess)")
+
+            if updateSuccess {
+                appLog("PhotoManager: Successfully updated album count in DB to \(newCount) for \(albumId)")
+                // 5. 在主线程发送通知，告知UI需要刷新
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+                    appLog("PhotoManager: Posted didUpdateAlbumList notification.")
+                }
+            } else {
+                appLog("PhotoManager: Failed to update album count in DB for \(albumId)")
+            }
+        } else {
+            // 如果没有找到相册，记录日志
+            appLog("PhotoManager: updateAlbumPhotoCount - Could not find album with id \(albumId) in DB to update count.")
         }
+        // }
     }
 
 
@@ -273,28 +331,48 @@ class PhotoManager {
 
         do {
             let fileURLs = try fileManager.contentsOfDirectory(at: albumDirectory,
-                                                                  includingPropertiesForKeys: [.creationDateKey], // 请求创建日期
+                                                                  includingPropertiesForKeys: [.creationDateKey], // Request creation date
                                                                   options: .skipsHiddenFiles)
-            // 过滤出 .jpg 文件
-             let photoFiles = fileURLs.filter { $0.pathExtension.lowercased() == "jpg" }
-             appLog("PhotoManager: getPhotos - Found \(photoFiles.count) jpg files")
+            
+            // Define supported extensions
+            let supportedExtensions = Set(["jpg", "jpeg", "png", "heic"])
+            
+            // Filter for supported image files
+            let photoFiles = fileURLs.filter { supportedExtensions.contains($0.pathExtension.lowercased()) }
+            appLog("PhotoManager: getPhotos - Found \(photoFiles.count) supported image files (jpg, jpeg, png, heic)")
 
 
             var photos: [Photo] = []
-            photos.reserveCapacity(photoFiles.count) // 预分配容量
+            photos.reserveCapacity(photoFiles.count) // Preallocate capacity
 
             for fileURL in photoFiles {
                 let fileName = fileURL.lastPathComponent
-                // 从文件名解析 UUID (如果文件名是 UUID.jpg)
-                let photoIdString = fileName.replacingOccurrences(of: ".jpg", with: "")
-                guard let photoId = UUID(uuidString: photoIdString) else {
-                     appLog("PhotoManager: getPhotos - Skipping file with invalid UUID name: \(fileName)")
-                     continue // 跳过无效文件名的文件
+                let fileExtension = fileURL.pathExtension.lowercased() // Get the actual extension
+                
+                // Parse filename to get the UUID part
+                var photoIdString = ""
+                
+                if let range = fileName.range(of: "_") {
+                    // If filename contains underscore, extract the UUID part before it
+                    photoIdString = String(fileName[..<range.lowerBound])
+                } else {
+                    // If no underscore, remove the extension to get the UUID
+                    // Use the actual fileExtension here
+                    if let range = fileName.range(of: ".\(fileExtension)", options: [.caseInsensitive, .backwards]) {
+                         photoIdString = String(fileName[..<range.lowerBound])
+                    } else {
+                         // Should not happen if filtering is correct, but handle as fallback
+                         photoIdString = fileName 
+                    }
+                }
+                
+                guard !photoIdString.isEmpty, let photoId = UUID(uuidString: photoIdString) else {
+                     appLog("PhotoManager: getPhotos - Skipping file with invalid UUID name format: \(fileName)")
+                     continue // Skip files with invalid filename format
                 }
 
-
                 do {
-                    // 获取创建日期
+                    // Get creation date
                     let resourceValues = try fileURL.resourceValues(forKeys: [.creationDateKey])
                     let creationDate = resourceValues.creationDate ?? Date() // 如果获取失败则使用当前日期
 
@@ -388,6 +466,89 @@ class PhotoManager {
         return image
     }
 
+    // 获取照片EXIF元数据
+    func getPhotoMetadata(for photo: Photo) -> [String: Any]? {
+        guard let imagePath = photo.imagePath else {
+            appLog("PhotoManager: getPhotoMetadata - Invalid image path for \(photo.fileName)")
+            return nil
+        }
+        
+        guard let imageSource = CGImageSourceCreateWithURL(imagePath as CFURL, nil) else {
+            appLog("PhotoManager: getPhotoMetadata - Failed to create image source for \(photo.fileName)")
+            return nil
+        }
+        
+        guard let metadata = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [String: Any] else {
+            appLog("PhotoManager: getPhotoMetadata - Failed to get metadata for \(photo.fileName)")
+            return nil
+        }
+        
+        return metadata
+    }
+    
+    // 获取照片拍摄时间
+    func getPhotoDateTaken(for photo: Photo) -> Date? {
+        guard let metadata = getPhotoMetadata(for: photo) else {
+            return photo.createdAt // 如果无法获取元数据，返回创建时间
+        }
+        
+        // 尝试从EXIF中获取日期
+        if let exif = metadata["{Exif}"] as? [String: Any],
+           let dateTimeOriginal = exif["DateTimeOriginal"] as? String {
+            // EXIF日期格式通常为："yyyy:MM:dd HH:mm:ss"
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+            if let date = formatter.date(from: dateTimeOriginal) {
+                return date
+            }
+        }
+        
+        // 尝试从TIFF中获取日期
+        if let tiff = metadata["{TIFF}"] as? [String: Any],
+           let dateTime = tiff["DateTime"] as? String {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+            if let date = formatter.date(from: dateTime) {
+                return date
+            }
+        }
+        
+        return photo.createdAt // 如果从元数据中无法获取日期，返回文件创建时间
+    }
+    
+    // 获取格式化的照片尺寸
+    func getPhotoSizeString(for photo: Photo) -> String {
+        guard let metadata = getPhotoMetadata(for: photo),
+              let width = metadata["PixelWidth"] as? Int,
+              let height = metadata["PixelHeight"] as? Int else {
+            return "未知尺寸"
+        }
+        
+        return "\(width) × \(height)"
+    }
+    
+    // 获取照片文件大小
+    func getPhotoFileSize(for photo: Photo) -> String {
+        guard let imagePath = photo.imagePath else {
+            return "未知大小"
+        }
+        
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: imagePath.path)
+            if let size = attributes[.size] as? Int64 {
+                // 格式化文件大小
+                let formatter = ByteCountFormatter()
+                formatter.allowedUnits = [.useMB, .useKB]
+                formatter.countStyle = .file
+                return formatter.string(fromByteCount: size)
+            }
+        } catch {
+            appLog("PhotoManager: getPhotoFileSize - Failed to get file size for \(photo.fileName): \(error)")
+        }
+        
+        return "未知大小"
+    }
+
     // --- 与系统相册交互 (占位符，需要实现) ---
     func deletePhotosFromLibrary(identifiers: [String], completion: @escaping (Bool, Error?) -> Void) {
         appLog("PhotoManager: deletePhotosFromLibrary - Attempting to delete \(identifiers.count) photos from system library.")
@@ -437,6 +598,92 @@ class PhotoManager {
         imageCache.removeAllObjects()
         appLog("PhotoManager: Cleared thumbnail cache.")
     }
+
+    // --- 修改：移动照片到指定相册 (基于文件移动) ---
+    func movePhotos(photosToMove: [Photo], to destinationAlbumId: UUID) -> Bool {
+        guard !photosToMove.isEmpty else {
+            appLog("PhotoManager: movePhotos - No photos provided to move.")
+            return true // Nothing to move, considered success
+        }
+        
+        appLog("PhotoManager: movePhotos - Attempting to move \(photosToMove.count) photos to album \(destinationAlbumId)")
+        var successCount = 0
+        var sourceAlbumId: UUID? = nil // Track the source album to update its count
+        let fileManager = FileManager.default
+        
+        // Get the destination directory URL
+        guard let destinationDirectory = getAlbumDirectory(for: destinationAlbumId) else {
+            appLog("PhotoManager: movePhotos - Failed to get or create destination album directory \(destinationAlbumId)")
+            return false
+        }
+        
+        for photo in photosToMove {
+            // Determine source album ID (only need to do this once)
+            if sourceAlbumId == nil {
+                sourceAlbumId = photo.albumId
+            }
+            
+            guard let sourcePath = photo.imagePath else {
+                appLog("PhotoManager: movePhotos - Could not get source path for photo \(photo.fileName). Skipping.")
+                continue
+            }
+            
+            // Check if source file exists
+            guard fileManager.fileExists(atPath: sourcePath.path) else {
+                appLog("PhotoManager: movePhotos - Source file does not exist at \(sourcePath.path). Skipping.")
+                // This might indicate an inconsistency, maybe update count anyway?
+                continue
+            }
+            
+            // Construct destination path
+            let destinationPath = destinationDirectory.appendingPathComponent(photo.fileName)
+            
+            // Attempt to move the file
+            do {
+                appLog("PhotoManager: movePhotos - Moving \(photo.fileName) from \(sourcePath.path) to \(destinationPath.path)")
+                try fileManager.moveItem(at: sourcePath, to: destinationPath)
+                appLog("PhotoManager: movePhotos - Successfully moved \(photo.fileName)")
+                
+                // Also move/invalidate cache for the thumbnail (using filename as key)
+                let cacheKey = photo.fileName as NSString
+                imageCache.removeObject(forKey: cacheKey)
+                appLog("PhotoManager: movePhotos - Invalidated cache for moved photo \(photo.fileName)")
+                
+                successCount += 1
+            } catch CocoaError.fileNoSuchFile {
+                // Source file disappeared before move, might be okay? Log it.
+                appLog("PhotoManager: movePhotos - Warning: Source file disappeared before move: \(sourcePath.path)")
+            } catch CocoaError.fileWriteFileExists {
+                 // Destination file already exists - This shouldn't happen if IDs are unique
+                 appLog("PhotoManager: movePhotos - Error: Destination file already exists: \(destinationPath.path). Skipping move.")
+                 // Consider this a failure for this photo
+            } catch {
+                appLog("PhotoManager: movePhotos - Error moving file \(photo.fileName): \(error)")
+                // Consider this a failure for this photo
+            }
+        }
+
+        // Update counts for source and destination albums only if moves occurred
+        if successCount > 0 {
+            appLog("PhotoManager: movePhotos - Updating album counts for \(successCount) moved photos.")
+            updateAlbumPhotoCount(albumId: destinationAlbumId, change: successCount)
+            if let srcId = sourceAlbumId {
+                updateAlbumPhotoCount(albumId: srcId, change: -successCount)
+                appLog("PhotoManager: movePhotos - Decremented source album \(srcId) count by \(successCount)")
+            } else {
+                appLog("PhotoManager: movePhotos - Warning: Could not determine source album ID to decrement count.")
+            }
+        }
+
+        // Return true if all requested photos were successfully moved
+        let allSucceeded = successCount == photosToMove.count
+        if !allSucceeded {
+             appLog("PhotoManager: movePhotos - Warning: \(photosToMove.count - successCount) photos failed to move.")
+        }
+        appLog("PhotoManager: movePhotos - Operation finished. Moved \(successCount)/\(photosToMove.count). Success: \(allSucceeded)")
+        return allSucceeded
+    }
+    // --- 结束修改 ---
 }
 
 // 添加对 UIImage 的扩展以辅助计算缓存成本 (可选)

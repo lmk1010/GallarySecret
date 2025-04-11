@@ -20,6 +20,13 @@ struct MainView: View {
                 .tag(1)
         }
         .accentColor(.blue)
+        .onChange(of: selectedTab) { newValue in
+            // 当切换到相册选项卡时发送通知以刷新相册列表
+            if newValue == 0 {
+                appLog("MainView: Tab changed to Albums. Posting notification to refresh album list.")
+                NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+            }
+        }
     }
 }
 
@@ -30,42 +37,49 @@ struct AlbumsListView: View {
     @State private var albumToDelete: Album?
     @Environment(\.colorScheme) var colorScheme
     
+    // 新增状态变量用于选择模式
+    @State private var isSelectionMode = false
+    @State private var selectedAlbumIDs = Set<UUID>()
+    @State private var showingMultiDeleteAlert = false
+
     var body: some View {
         NavigationView {
             ScrollView {
                 LazyVStack(spacing: 20) {
-                    // 创建新相册卡片
-                    VStack {
-                        Button(action: {
-                            showingCreateSheet = true
-                        }) {
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 15)
-                                    .fill(colorScheme == .dark ? 
-                                          Color.blue.opacity(0.2) : Color.blue.opacity(0.1))
-                                    .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.3 : 0.1), 
-                                            radius: 5, x: 0, y: 2)
-                                
-                                VStack(spacing: 12) {
-                                    Image(systemName: "plus.circle.fill")
-                                        .font(.system(size: 40))
-                                        .foregroundColor(.blue)
+                    // 创建新相册卡片 (仅在非选择模式下显示)
+                    if !isSelectionMode {
+                        VStack {
+                            Button(action: {
+                                showingCreateSheet = true
+                            }) {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 15)
+                                        .fill(colorScheme == .dark ? 
+                                              Color.blue.opacity(0.2) : Color.blue.opacity(0.1))
+                                        .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.3 : 0.1), 
+                                                radius: 5, x: 0, y: 2)
                                     
-                                    Text("创建新相册")
-                                        .font(.headline)
-                                        .foregroundColor(.blue)
+                                    VStack(spacing: 12) {
+                                        Image(systemName: "plus.circle.fill")
+                                            .font(.system(size: 40))
+                                            .foregroundColor(.blue)
+                                        
+                                        Text("创建新相册")
+                                            .font(.headline)
+                                            .foregroundColor(.blue)
+                                    }
+                                    .padding()
                                 }
-                                .padding()
+                                .frame(height: 150)
+                                .padding(.horizontal)
                             }
-                            .frame(height: 150)
-                            .padding(.horizontal)
+                            .buttonStyle(PlainButtonStyle())
                         }
-                        .buttonStyle(PlainButtonStyle())
+                        .padding(.top)
                     }
-                    .padding(.top)
                     
                     // 相册列表
-                    if albums.isEmpty {
+                    if albums.isEmpty && !isSelectionMode { // 在选择模式下即使为空也显示列表区域
                         VStack(spacing: 20) {
                             Image(systemName: "photo.on.rectangle.angled")
                                 .font(.system(size: 50))
@@ -75,7 +89,7 @@ struct AlbumsListView: View {
                                 .font(.headline)
                                 .foregroundColor(.gray)
                             
-                            Text("点击顶部的"+"按钮创建一个新相册")
+                            Text("点击右上角的"+"按钮创建一个新相册")
                                 .font(.subheadline)
                                 .foregroundColor(.gray)
                                 .multilineTextAlignment(.center)
@@ -84,39 +98,14 @@ struct AlbumsListView: View {
                         .padding(.top, 50)
                     } else {
                         ForEach(albums) { album in
-                            ZStack {
-                                NavigationLink(destination: PhotoGridView(album: album)) {
-                                    AlbumCard(album: album)
-                                }
-                                .buttonStyle(PlainButtonStyle())
-                            }
-                            .contextMenu {
-                                Button(action: {
-                                    deleteAlbum(album)
-                                }) {
-                                    Label("删除相册", systemImage: "trash")
-                                }
-                            }
-                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                                Button(role: .destructive) {
-                                    deleteAlbum(album)
-                                } label: {
-                                    Label("删除", systemImage: "trash")
-                                }
-                            }
+                            albumRow(album: album) // 使用重构的行视图
                         }
                     }
                 }
                 .padding(.vertical)
             }
-            .navigationTitle("隐私相册")
-            .navigationBarItems(trailing: 
-                Button(action: {
-                    showingCreateSheet = true
-                }) {
-                    Image(systemName: "plus")
-                }
-            )
+            .navigationTitle(navigationTitle) // 动态标题
+            .navigationBarItems(leading: leadingNavigationButton, trailing: trailingNavigationButtons) // 动态按钮
             .sheet(isPresented: $showingCreateSheet) {
                 CreateAlbumView(onAlbumCreated: { newAlbum in
                     self.albums.insert(newAlbum, at: 0)
@@ -124,43 +113,228 @@ struct AlbumsListView: View {
             }
             .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
             .onAppear {
-                // 从数据库加载相册
+                // 每次进入页面时强制从数据库重新加载相册数据
+                appLog("AlbumsListView: onAppear 强制刷新相册列表")
                 self.albums = DatabaseManager.shared.getAllAlbums()
             }
-            .alert(isPresented: $showingDeleteAlert) {
+            .onReceive(NotificationCenter.default.publisher(for: .didUpdateAlbumList)) { _ in
+                 appLog("AlbumsListView: Received didUpdateAlbumList notification. Reloading albums.")
+                 // 收到通知后重新加载相册数据
+                 self.albums = DatabaseManager.shared.getAllAlbums()
+            }
+            .alert(isPresented: $showingDeleteAlert) { // 单个删除确认 - 移除外部标题
                 Alert(
                     title: Text("删除相册"),
-                    message: Text("确定要删除相册\"\(albumToDelete?.name ?? "")\"吗？此操作不可恢复。"),
+                    message: Text("确定要删除相册\"\(albumToDelete?.name ?? "")\"吗？此操作将同时删除相册内的所有照片，且不可恢复。"),
                     primaryButton: .destructive(Text("删除")) {
                         if let album = albumToDelete {
                             performDelete(album)
                         }
                     },
-                    secondaryButton: .cancel(Text("取消"))
+                    secondaryButton: .cancel(Text("取消")) {
+                         albumToDelete = nil // 清理
+                    }
                 )
+            }
+            .alert("删除所选相册?", isPresented: $showingMultiDeleteAlert) { // 批量删除确认
+                 Button("删除", role: .destructive) {
+                     deleteSelectedAlbums()
+                 }
+                 Button("取消", role: .cancel) {}
+             } message: {
+                 Text("确定要删除选中的 \(selectedAlbumIDs.count) 个相册吗？此操作将同时删除相册内的所有照片，且不可恢复。")
+             }
+            .toolbar { // 底部多选删除工具栏
+                 ToolbarItemGroup(placement: .bottomBar) {
+                     if isSelectionMode {
+                         Spacer()
+                         Button("删除 (\(selectedAlbumIDs.count))") {
+                             if !selectedAlbumIDs.isEmpty {
+                                  showingMultiDeleteAlert = true
+                             }
+                         }
+                         .disabled(selectedAlbumIDs.isEmpty)
+                         .foregroundColor(selectedAlbumIDs.isEmpty ? .gray : .red)
+                     }
+                 }
+             }
+        }
+    }
+    
+    // MARK: - Subviews
+    
+    // 重构的相册行视图
+    @ViewBuilder
+    private func albumRow(album: Album) -> some View {
+        HStack {
+            // 选择模式下的勾选框
+            if isSelectionMode {
+                Image(systemName: selectedAlbumIDs.contains(album.id) ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(selectedAlbumIDs.contains(album.id) ? .blue : .gray)
+                    .font(.title2)
+                    .padding(.leading)
+                    .onTapGesture { // 点击勾选框也可选择
+                        toggleSelection(for: album)
+                    }
+            }
+            
+            // AlbumCard 或 NavigationLink
+            Group {
+                 if isSelectionMode {
+                     AlbumCard(album: album)
+                         .onTapGesture {
+                             toggleSelection(for: album)
+                         }
+                 } else {
+                     NavigationLink(destination: PhotoGridView(album: album)) {
+                         AlbumCard(album: album)
+                     }
+                     .buttonStyle(PlainButtonStyle())
+                 }
+            }
+            .contentShape(Rectangle()) // 让空白区域也能触发手势
+            .onLongPressGesture {
+                 if !isSelectionMode {
+                     enterSelectionMode(selecting: album)
+                 }
+            }
+            .contextMenu {
+                 // 在非选择模式下才显示右键删除
+                 if !isSelectionMode {
+                     Button(role: .destructive) {
+                         deleteAlbumConfirmation(album) // 触发单个删除确认
+                     } label: {
+                         Label("删除相册", systemImage: "trash")
+                     }
+                 }
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                 // 允许在任何模式下滑动删除
+                 Button(role: .destructive) {
+                     deleteAlbumConfirmation(album) // 触发单个删除确认
+                 } label: {
+                     Label("删除", systemImage: "trash")
+                 }
+             }
+        }
+        // 添加动画
+        .animation(.easeInOut(duration: 0.2), value: isSelectionMode)
+        .animation(.easeInOut(duration: 0.15), value: selectedAlbumIDs.contains(album.id))
+    }
+    
+    // MARK: - Navigation Bar Items
+    
+    private var navigationTitle: String {
+        isSelectionMode ? "已选择 \(selectedAlbumIDs.count) 项" : "隐私相册"
+    }
+
+    private var leadingNavigationButton: some View {
+        Group {
+            if isSelectionMode {
+                Button("取消") {
+                    exitSelectionMode()
+                }
+            } else {
+                EmptyView() // 非选择模式下不显示
+            }
+        }
+    }
+
+    private var trailingNavigationButtons: some View {
+        Group {
+            if isSelectionMode {
+                // 选择模式下不显示"+"按钮
+                EmptyView()
+            } else {
+                // 非选择模式下显示 "选择" 和 "+"
+                 HStack {
+                    Button("选择") {
+                        enterSelectionMode()
+                    }
+                     
+                    Button(action: {
+                        showingCreateSheet = true
+                    }) {
+                        Image(systemName: "plus")
+                    }
+                 }
             }
         }
     }
     
-    // 删除相册
-    private func deleteAlbum(_ album: Album) {
+    // MARK: - Actions & Logic
+    
+    // 进入选择模式
+    private func enterSelectionMode(selecting album: Album? = nil) {
+        isSelectionMode = true
+        selectedAlbumIDs.removeAll() // 清空之前的选择
+        if let albumToSelect = album {
+            selectedAlbumIDs.insert(albumToSelect.id) // 选中长按的相册
+        }
+    }
+
+    // 退出选择模式
+    private func exitSelectionMode() {
+        isSelectionMode = false
+        selectedAlbumIDs.removeAll()
+    }
+
+    // 切换相册选中状态
+    private func toggleSelection(for album: Album) {
+        if selectedAlbumIDs.contains(album.id) {
+            selectedAlbumIDs.remove(album.id)
+        } else {
+            selectedAlbumIDs.insert(album.id)
+        }
+    }
+
+    // 删除单个相册（触发确认）- 重命名以区分
+    private func deleteAlbumConfirmation(_ album: Album) {
         self.albumToDelete = album
         self.showingDeleteAlert = true
     }
     
-    // 执行删除操作
+    // 执行单个删除操作
     private func performDelete(_ album: Album) {
         // 从数据库中删除
         if DatabaseManager.shared.deleteAlbum(id: album.id) {
             // 更新UI
             if let index = albums.firstIndex(where: { $0.id == album.id }) {
                 albums.remove(at: index)
+                appLog("Successfully deleted album: \(album.name)")
             }
+        } else {
+            appLog("Failed to delete album: \(album.name)")
+            // 可以考虑添加错误提示
         }
+        albumToDelete = nil // 清理
+    }
+    
+    // 删除选中的相册
+    private func deleteSelectedAlbums() {
+         let idsToDelete = selectedAlbumIDs // 复制一份
+         var deletedCount = 0
+         appLog("Attempting to delete \(idsToDelete.count) selected albums.")
+
+         for albumId in idsToDelete {
+             if DatabaseManager.shared.deleteAlbum(id: albumId) {
+                 deletedCount += 1
+                 appLog("Successfully deleted album with ID: \(albumId)")
+             } else {
+                 appLog("Failed to delete album with ID: \(albumId)")
+                 // 可以考虑给用户一些反馈
+             }
+         }
+
+         appLog("Finished deleting. Deleted \(deletedCount) out of \(idsToDelete.count) albums.")
+
+         // 移除已删除的相册并退出选择模式
+         albums.removeAll { idsToDelete.contains($0.id) }
+         exitSelectionMode() // 退出选择模式并清空 selectedAlbumIDs
     }
 }
 
-struct Album: Identifiable {
+struct Album: Identifiable, Equatable { // Conform to Equatable for removeAll
     let id: UUID
     let name: String
     let coverImage: String
@@ -173,6 +347,11 @@ struct Album: Identifiable {
         self.coverImage = coverImage
         self.count = count
         self.createdAt = createdAt
+    }
+    
+    // Implement Equatable
+    static func == (lhs: Album, rhs: Album) -> Bool {
+        lhs.id == rhs.id
     }
 }
 
@@ -217,6 +396,7 @@ struct AlbumCard: View {
                     
                     HStack {
                         Text("\(album.count) 张照片")
+                            .id("count-\(album.id)-\(album.count)")
                             .font(.subheadline)
                             .foregroundColor(.gray)
                         

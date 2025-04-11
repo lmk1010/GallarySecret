@@ -57,7 +57,7 @@ class ThumbnailCacheManager: ObservableObject {
 
         // 2. Check disk cache (asynchronously)
         if let fileUrl = diskCacheUrl(for: photoId) {
-            diskQueue.async { // Perform disk check off the main thread
+            diskQueue.async { // 修复：使用diskQueue异步检查磁盘缓存
                 if self.fileManager.fileExists(atPath: fileUrl.path) {
                     // appLog("ThumbnailCacheManager: Disk Cache hit for \(photo.fileName)")
                     if let data = try? Data(contentsOf: fileUrl), let image = UIImage(data: data) {
@@ -75,8 +75,12 @@ class ThumbnailCacheManager: ObservableObject {
                         try? self.fileManager.removeItem(at: fileUrl)
                     }
                 }
-                // Not found in disk cache or failed to load, proceed to generation
-                self.generateAndCacheThumbnail(for: photo, completion: completion)
+                
+                // 切换到主线程调用生成缩略图的方法
+                DispatchQueue.main.async {
+                    // Not found in disk cache or failed to load, proceed to generation
+                    self.generateAndCacheThumbnail(for: photo, completion: completion)
+                }
             }
         } else {
             // Disk cache disabled, proceed to generation
@@ -144,36 +148,74 @@ class ThumbnailCacheManager: ObservableObject {
     // Preload function
     func preloadThumbnails(for photos: [Photo]) {
         appLog("ThumbnailCacheManager: Starting preload for \(photos.count) photos.")
-        for photo in photos {
-            let photoId = photo.id
+        // 限制同时预加载的图片数量
+        let maxConcurrentPreloads = 3 // Keep this relatively low for background tasks
 
-            // 1. Check memory cache
-            if memoryCache.object(forKey: photoId as NSUUID) != nil {
-                // appLog("ThumbnailCacheManager (Preload): Memory Hit for \(photo.fileName). Skipping.")
-                continue
-            }
+        // 使用信号量控制并发
+        let preloadSemaphore = DispatchSemaphore(value: maxConcurrentPreloads)
+        let preloadGroup = DispatchGroup()
 
-            // 2. Check disk cache (async is okay for preload)
-            if let fileUrl = diskCacheUrl(for: photoId) {
-                 diskQueue.async {
-                     if self.fileManager.fileExists(atPath: fileUrl.path) {
-                         // appLog("ThumbnailCacheManager (Preload): Disk Hit for \(photo.fileName). Skipping generation.")
-                         // Optional: Could load into memory here if desired
-                         return
-                     }
-                     // Not on disk, proceed to check loading state and maybe generate
-                     self.checkAndGenerateForPreload(photo: photo)
-                 }
-            } else {
-                 // Disk cache disabled, check loading state and maybe generate
-                 checkAndGenerateForPreload(photo: photo)
+        Task { // Use a single outer Task to manage the loop and group notification
+            for photo in photos {
+                let photoId = photo.id
+
+                // 1. Check memory cache (sync)
+                if memoryCache.object(forKey: photoId as NSUUID) != nil {
+                    // appLog("ThumbnailCacheManager (Preload): Memory Hit for \(photo.fileName). Skipping.")
+                    continue
+                }
+
+                // Wait for a slot
+                preloadSemaphore.wait()
+                preloadGroup.enter()
+
+                // Launch detached task for disk check & generation
+                Task.detached(priority: .background) {
+                    var foundOrGenerated = false
+
+                    // 2. Check disk cache (async on diskQueue)
+                    if let fileUrl = self.diskCacheUrl(for: photoId) {
+                        let fileExists = await Task { // Check file existence on disk queue
+                            return await withCheckedContinuation { cont in
+                                self.diskQueue.async {
+                                    cont.resume(returning: self.fileManager.fileExists(atPath: fileUrl.path))
+                                }
+                            }
+                        }.value
+
+                        if fileExists {
+                            // appLog("ThumbnailCacheManager (Preload): Disk Hit for \(photo.fileName). Skipping generation.")
+                            foundOrGenerated = true
+                        }
+                    }
+
+                    // 3. Generate if not found and not already loading
+                    if !foundOrGenerated {
+                        // Use await with the checkAndGenerateForPreload function which now MUST call its completion
+                        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                            self.checkAndGenerateForPreload(photo: photo) {
+                                foundOrGenerated = true // Mark as handled
+                                cont.resume() // Resume the continuation when checkAndGenerate completes
+                            }
+                        }
+                    }
+
+                    // Task finished, release semaphore and leave group
+                    preloadSemaphore.signal()
+                    preloadGroup.leave()
+                } // End detached Task
+            } // End for loop
+
+            // Notify main thread when all tasks associated with the group are done
+            preloadGroup.notify(queue: DispatchQueue.main) {
+                appLog("ThumbnailCacheManager: All preload tasks completed.")
             }
-        }
+        } // End outer Task
     }
-    
-    private func checkAndGenerateForPreload(photo: Photo) {
+
+    private func checkAndGenerateForPreload(photo: Photo, completion: @escaping () -> Void) { // Ensure completion is defined
          let photoId = photo.id
-         
+
          lock.lock()
          let isLoading = loadingTasks.contains(photoId)
          if !isLoading {
@@ -189,7 +231,7 @@ class ThumbnailCacheManager: ObservableObject {
                      // Store in memory
                      let cost = Int(image.size.width * image.size.height * image.scale * 4)
                      self.memoryCache.setObject(image, forKey: photoId as NSUUID, cost: cost)
-                     
+
                      // Store on disk
                      if let fileUrl = self.diskCacheUrl(for: photoId), let data = image.jpegData(compressionQuality: 0.8) {
                          self.diskQueue.async {
@@ -207,9 +249,14 @@ class ThumbnailCacheManager: ObservableObject {
                  self.lock.lock()
                  self.loadingTasks.remove(photoId)
                  self.lock.unlock()
+
+                 // !!! Crucial: Call completion handler !!!
+                 completion()
              }
          } else {
              // appLog("ThumbnailCacheManager (Preload): \(photo.fileName) is already loading. Skipping.")
+             // !!! Crucial: Call completion handler even if skipping !!!
+             completion()
          }
     }
 }
@@ -304,6 +351,12 @@ struct AsyncThumbnailView: View {
     // Removed old loadThumbnail and getExistingThumbnail methods
 }
 
+// MARK: - PhotoGridView
+// 注意：此视图应该嵌套在NavigationStack或NavigationView中使用，而不是在此处嵌套
+// 例如:
+// NavigationStack {
+//    PhotoGridView(album: selectedAlbum)
+// }
 struct PhotoGridView: View {
     let album: Album
     @State private var gridLayout = [
@@ -332,6 +385,7 @@ struct PhotoGridView: View {
     @State private var showMultiDeleteAlert = false // 用于批量删除确认
     @State private var photoToDeleteSingle: Photo? = nil
     @State private var showSingleDeleteAlert = false
+    @State private var showAlbumSelectionSheet = false // <-- ADD State for sheet
     
     // Create the thumbnail cache manager
     @StateObject private var thumbnailCacheManager = ThumbnailCacheManager()
@@ -347,29 +401,99 @@ struct PhotoGridView: View {
             loadingView
         }
         .navigationTitle(navigationTitle)
-        .navigationBarItems(leading: leadingNavigationButton, trailing: trailingButtons)
+        .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
+        // 添加iOS 16的工具栏背景优化
+        .if16Available { view in
+            view.toolbarBackground(.visible, for: .navigationBar)
+        }
         .toolbar {
-            ToolbarItemGroup(placement: .bottomBar) {
+            // Log before the condition
+            let _ = appLog("Toolbar evaluated. isSelectionMode = \\(isSelectionMode)")
+
+            // Leading Item (Cancel button in selection mode)
+            ToolbarItem(placement: .navigationBarLeading) {
                 if isSelectionMode {
-                    Spacer()
-                    Button("删除 (\(selectedPhotoIDs.count))") {
+                    Button("取消") {
+                        exitSelectionMode()
+                    }
+                }
+                // No else needed, shows nothing when not in selection mode
+            }
+
+            // Trailing Items - Use individual ToolbarItems
+            if isSelectionMode {
+                // Delete Button
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
                         if !selectedPhotoIDs.isEmpty {
                              showMultiDeleteAlert = true
                         }
+                    } label: {
+                        Image(systemName: "trash")
                     }
                     .disabled(selectedPhotoIDs.isEmpty)
                     .foregroundColor(selectedPhotoIDs.isEmpty ? .gray : .red)
                 }
+
+                // Share/Move Menu
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            shareSelectedPhotosExternally()
+                        } label: {
+                            Label("分享到...", systemImage: "square.and.arrow.up")
+                        }
+                        .disabled(selectedPhotoIDs.isEmpty)
+
+                        Button {
+                            showAlbumSelectionSheet = true
+                        } label: {
+                            Label("移动到相册...", systemImage: "folder")
+                        }
+                        .disabled(selectedPhotoIDs.isEmpty)
+
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .disabled(selectedPhotoIDs.isEmpty)
+                }
+            } else {
+                // Place Select and Import buttons in separate ToolbarItems
+                // Place "Select" button first (appears further right)
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("选择") {
+                        enterSelectionMode()
+                    }
+                }
+                // Place PhotosPicker ("+") next
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    PhotosPicker(
+                        selection: $selectedItems,
+                        matching: .images,
+                        photoLibrary: .shared()
+                    ) {
+                        Image(systemName: "plus")
+                    }
+                    .onChange(of: selectedItems) { newItems in
+                        importPhotos(from: newItems)
+                    }
+                }
             }
         }
-        .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
+        .sheet(isPresented: $showAlbumSelectionSheet) {
+            // Present the AlbumSelectionView
+            AlbumSelectionView(selectedPhotoIDs: selectedPhotoIDs, currentAlbumId: album.id) { destinationAlbumId in
+                // This closure is called when an album is selected in the sheet
+                moveSelectedPhotos(to: destinationAlbumId)
+                showAlbumSelectionSheet = false // Dismiss the sheet
+            }
+        }
         .fullScreenCover(item: $selectedPhoto, onDismiss: {
             appLog("照片详情视图已关闭 (item dismissed)")
         }) { photo in
             if let index = photos.firstIndex(where: { $0.id == photo.id }) {
-                let _ = appLog("fullScreenCover(item:): Creating ImageDetailView for \(photo.fileName) at index \(index)")
+                let _ = appLog("fullScreenCover(item:): Creating ImageDetailView for \\(photo.fileName) at index \\(index)")
                 ImageDetailView(
-                    currentPhoto: photo,
                     photoIndex: index,
                     allPhotos: photos,
                     onDelete: { photoToDelete in
@@ -388,7 +512,7 @@ struct PhotoGridView: View {
                 }
                 .ignoresSafeArea()
             } else {
-                let _ = appLog("fullScreenCover(item:): Error - Could not find index for presented photo \(photo.fileName)")
+                let _ = appLog("fullScreenCover(item:): Error - Could not find index for presented photo \\(photo.fileName)")
                 EmptyView()
             }
         }
@@ -621,56 +745,116 @@ struct PhotoGridView: View {
         guard !items.isEmpty else { return }
         
         isLoading = true
-        var importedIdentifiersSuccess: [String] = [] // 改为局部变量
+        var successfullyImportedIdentifiers: [String] = [] // 本次成功导入的系统标识符
+        var successfullySavedPhotos: [Photo] = [] // 本次成功保存的 Photo 对象
+        var failedIdentifiers: [String: String] = [:] // 记录失败的标识符和原因
 
-        Task {
-            var newPhotos: [Photo] = []
+        Task(priority: .userInitiated) { // 使用 userInitiated 优先级
+            appLog("开始导入 \(items.count) 张照片...")
             
-            for item in items {
+            // 按顺序处理每个选中的项目
+            for (index, item) in items.enumerated() {
                 guard let identifier = item.itemIdentifier else {
-                    appLog("Warning: Could not get itemIdentifier for a selected photo.")
+                    appLog("导入警告 (项 \(index + 1)/\(items.count)): 无法获取照片标识符，已跳过。")
+                    failedIdentifiers["未知标识符_\(index)"] = "无法获取标识符"
                     continue
                 }
-
+                
+                appLog("开始处理照片 (项 \(index + 1)/\(items.count)): ID = \(identifier)")
+                
+                // 1. 获取元数据 (文件名和日期)
+                var originalFileName = "未知文件名_\(UUID().uuidString.prefix(6))" // 提供唯一默认名
+                var dateTaken: Date? = nil
+                let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+                if let asset = fetchResult.firstObject {
+                    let resources = PHAssetResource.assetResources(for: asset)
+                    if let resource = resources.first { originalFileName = resource.originalFilename }
+                    dateTaken = asset.creationDate // 使用创建日期
+                    appLog("  - 获取元数据成功: 文件名='\(originalFileName)', 日期=\(dateTaken?.description ?? "无")")
+                } else {
+                    appLog("  - 警告: 无法从 PhotoKit 获取 PHAsset: \(identifier)")
+                    // 即使无法获取，也继续尝试加载数据
+                }
+                
+                // 2. 加载照片数据
+                var loadedData: Data? = nil
                 do {
-                    // 修改：合并 data 的解包和 UIImage 的创建
-                    if let data = try await item.loadTransferable(type: Data.self),
-                       let image = UIImage(data: data) { 
-                        // 尝试保存到 App 内部存储
-                        if let photo = PhotoManager.shared.savePhoto(image: image, toAlbum: album.id) {
-                            newPhotos.append(photo)
-                            importedIdentifiersSuccess.append(identifier) // 记录成功导入的系统标识符
-                            appLog("Successfully imported photo with identifier: \(identifier)")
-                        } else {
-                             appLog("Warning: Failed to save photo data internally for identifier: \(identifier)")
-                        }
+                    loadedData = try await item.loadTransferable(type: Data.self)
+                    if let data = loadedData, !data.isEmpty {
+                        appLog("  - 加载照片数据成功: 大小 = \(data.count) 字节")
                     } else {
-                         // 修改：统一处理加载数据失败或创建 UIImage 失败的情况
-                         appLog("Warning: Failed to load data or create UIImage for identifier: \(identifier)")
+                        appLog("  - 错误: 加载的照片数据为空或失败: \(identifier)")
+                        failedIdentifiers[identifier] = "加载数据失败或为空"
+                        loadedData = nil // 确保为 nil
                     }
                 } catch {
-                    appLog("Error loading transferable data for identifier \(identifier): \(error)")
+                    appLog("  - 错误: 加载 transferable data 时发生异常: \(identifier), 错误: \(error)")
+                    failedIdentifiers[identifier] = "加载数据异常: \(error.localizedDescription)"
+                    loadedData = nil
                 }
+                
+                // 如果数据加载失败，则跳过此照片
+                guard let imageData = loadedData else {
+                    appLog("  - 跳过照片 \(identifier) 因为数据加载失败。")
+                    continue
+                }
+                
+                // 3. 创建 UIImage
+                guard let image = UIImage(data: imageData) else {
+                    appLog("  - 错误: 无法从加载的数据创建 UIImage: \(identifier)")
+                    failedIdentifiers[identifier] = "无法创建UIImage"
+                    continue
+                }
+                appLog("  - 创建 UIImage 成功: 尺寸 = \(image.size)")
+                
+                // 4. 保存照片 (调用 PhotoManager)
+                appLog("  - 调用 PhotoManager.savePhoto 保存照片...")
+                if let savedPhoto = PhotoManager.shared.savePhoto(image: image, toAlbum: album.id, originalFileName: originalFileName, dateTaken: dateTaken) {
+                    appLog("  - 保存照片成功: \(identifier), 返回 Photo 对象: \(savedPhoto.fileName)")
+                    successfullySavedPhotos.append(savedPhoto)
+                    successfullyImportedIdentifiers.append(identifier)
+                } else {
+                    appLog("  - 错误: PhotoManager.savePhoto 返回 nil，保存失败: \(identifier)")
+                    failedIdentifiers[identifier] = "PhotoManager 保存失败 (返回nil)"
+                }
+                
+                appLog("完成处理照片 (项 \(index + 1)/\(items.count)): ID = \(identifier)")
             }
             
-            // 切换回主线程更新 UI 和触发弹窗
-            await MainActor.run {
-                self.photos.insert(contentsOf: newPhotos, at: 0)
-                self.selectedItems = [] // 清空 PhotosPicker 的选择
-                self.isLoading = false
-                loadPhotos() // 刷新照片列表和相册计数, 这会触发预加载
+            // 5. 导入过程结束，记录总结
+            appLog("照片导入流程结束。总共尝试 \(items.count) 项，成功保存 \(successfullySavedPhotos.count) 张，失败 \(failedIdentifiers.count) 张。")
+            if !failedIdentifiers.isEmpty {
+                appLog("失败详情: \(failedIdentifiers)")
+            }
 
-                if !importedIdentifiersSuccess.isEmpty {
-                    // 保存成功导入的标识符到 State 变量
-                    self.successfullyImportedIdentifiers = importedIdentifiersSuccess
-                    // 显示删除确认弹窗
-                    self.showDeleteFromLibraryAlert = true
-                    appLog("Import complete. Prompting user to delete \(importedIdentifiersSuccess.count) photos from library.")
+            // 6. 更新 UI (切换回主线程)
+            await MainActor.run {
+                self.isLoading = false
+
+                if !successfullySavedPhotos.isEmpty {
+                    appLog("Import successful. Notification should trigger AlbumsListView refresh.") // Update log message
+                    // 稍作延迟以确保数据一致性，然后刷新
+                    // NOTE: Removed the redundant self.loadPhotos() call here.
+                    // AlbumsListView's .onReceive will handle the refresh.
+                    
+                    // 添加loadPhotos()调用，确保导入后刷新照片列表
+                    self.loadPhotos()
+                    appLog("Called loadPhotos() to refresh the photo grid after import")
+
+                    // Prepare to show the delete prompt
+                    self.successfullyImportedIdentifiers = successfullyImportedIdentifiers
+                    self.showDeleteFromLibraryAlert = true // Show delete prompt
+                    appLog("Will prompt to delete \\(successfullyImportedIdentifiers.count) photos from library.")
                 } else {
-                    appLog("Import process finished, but no photos were successfully imported and saved.")
-                     // 可以选择显示一个提示告知用户导入失败
-                     self.deleteAlertMessage = "照片导入失败，请重试。"
-                     self.showResultAlert = true
+                    appLog("没有照片成功保存，显示导入失败提示。")
+                    self.deleteAlertMessage = "照片导入失败。尝试了 \\(items.count) 张，成功 0 张。详情请查看日志。"
+                    if !failedIdentifiers.isEmpty {
+                        // 只取第一个失败原因作为示例给用户看
+                        if let firstError = failedIdentifiers.first?.value {
+                            self.deleteAlertMessage += "\n(可能原因: \(firstError))"
+                        }
+                    }
+                    self.showResultAlert = true
                 }
             }
         }
@@ -731,32 +915,124 @@ struct PhotoGridView: View {
         }
     }
 
-    // 导航栏左侧按钮 (取消选择)
-    private var leadingNavigationButton: some View {
-        Group {
-            if isSelectionMode {
-                Button("取消") {
-                    exitSelectionMode()
-                }
-            } else {
-                EmptyView() // 非选择模式下不显示
-            }
-        }
-    }
-
     // 进入选择模式
     private func enterSelectionMode() {
         isSelectionMode = true
         selectedPhotoIDs.removeAll() // 清空之前的选择
+        appLog("enterSelectionMode called. isSelectionMode is now TRUE")
     }
 
     // 退出选择模式
     private func exitSelectionMode() {
         isSelectionMode = false
         selectedPhotoIDs.removeAll()
+        appLog("exitSelectionMode called. isSelectionMode is now FALSE")
     }
 
-    // 新增：添加缺失的函数定义 (空实现)
+    // MARK: - Move Photos Function
+    private func moveSelectedPhotos(to destinationAlbumId: UUID) {
+        guard !selectedPhotoIDs.isEmpty else { return }
+        
+        // Filter the current photos array to get the full Photo objects to move
+        let photosToMove = photos.filter { selectedPhotoIDs.contains($0.id) }
+        
+        guard !photosToMove.isEmpty else {
+            appLog("moveSelectedPhotos: No matching Photo objects found for selected IDs. Aborting move.")
+            // Maybe clear selection and show an error?
+            exitSelectionMode()
+            return
+        }
+
+        appLog("Attempting to move \(photosToMove.count) photos to album ID: \(destinationAlbumId)")
+
+        // Call the updated movePhotos function in PhotoManager
+        let success = PhotoManager.shared.movePhotos(photosToMove: photosToMove, to: destinationAlbumId)
+
+        if success {
+            appLog("Successfully moved \(photosToMove.count) photos.")
+            // Show success message
+            deleteAlertMessage = "已成功移动 \(photosToMove.count) 张照片。"
+            showResultAlert = true
+        } else {
+            appLog("Failed to move some or all photos.")
+            // Show potentially more specific failure message if needed
+            deleteAlertMessage = "移动部分或全部照片失败，请检查日志或重试。"
+            showResultAlert = true
+        }
+
+        // Cleanup and refresh
+        exitSelectionMode() // Also clears selectedPhotoIDs
+        loadPhotos() // Refresh the current album view
+    }
+
+    // MARK: - Sharing Functions
+    private func shareSelectedPhotosExternally() {
+        guard !selectedPhotoIDs.isEmpty else { return }
+
+        appLog("Starting external share for \(selectedPhotoIDs.count) photos.")
+
+        // Show loading indicator if needed (optional)
+        // self.isSharingExternally = true 
+
+        Task {
+            var imagesToShare: [UIImage] = []
+            let photosToLoad = photos.filter { selectedPhotoIDs.contains($0.id) }
+
+            // Load images asynchronously
+            for photo in photosToLoad {
+                if let image = await PhotoManager.shared.loadFullImage(for: photo) {
+                    imagesToShare.append(image)
+                } else {
+                    appLog("Warning: Failed to load full image for sharing: \(photo.fileName)")
+                    // Optionally notify user about failures
+                }
+            }
+
+            await MainActor.run {
+                // Hide loading indicator
+                // self.isSharingExternally = false
+
+                if imagesToShare.isEmpty {
+                    appLog("External Share Error: No images could be loaded.")
+                    // Show an alert to the user
+                    self.deleteAlertMessage = "无法加载所选照片以进行分享。"
+                    self.showResultAlert = true
+                    return
+                }
+
+                appLog("Successfully loaded \(imagesToShare.count) images for sharing. Presenting share sheet.")
+
+                let activityViewController = UIActivityViewController(activityItems: imagesToShare, applicationActivities: nil)
+
+                // Find the current key window scene to present the share sheet
+                guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+                      let rootViewController = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+                    appLog("External Share Error: Could not find root view controller to present share sheet.")
+                    self.deleteAlertMessage = "无法弹出分享窗口。"
+                    self.showResultAlert = true
+                    return
+                }
+
+                // Find the most appropriate view controller to present from
+                var topController = rootViewController
+                while let presentedViewController = topController.presentedViewController {
+                    topController = presentedViewController
+                }
+
+                // Recommended for iPad compatibility
+                if let popoverController = activityViewController.popoverPresentationController {
+                    popoverController.sourceView = topController.view // Use the presenting view controller's view
+                    // You might want to refine sourceRect based on the tapped button's position
+                    popoverController.sourceRect = CGRect(x: topController.view.bounds.midX, y: topController.view.bounds.midY, width: 0, height: 0) 
+                    popoverController.permittedArrowDirections = [] // Or specify arrow directions
+                }
+
+                topController.present(activityViewController, animated: true, completion: nil)
+            }
+        }
+    }
+
+    // MARK: - Delete Functions
     private func deleteImportedPhotosFromLibrary() {
         appLog("Placeholder: deleteImportedPhotosFromLibrary() called. Need to implement logic to delete from PHPhotoLibrary.")
         // 实际实现需要使用 PhotoKit 来请求权限并删除 PHAsset
@@ -768,592 +1044,417 @@ struct PhotoGridView: View {
     }
 }
 
-// 照片详情视图
+// MARK: - Navigation Helper 
+// iOS 16及以上版本可以使用此方法来包装PhotoGridView
+extension PhotoGridView {
+    // 将这个视图包装在NavigationStack中使用
+    func embedInNavigationStack() -> some View {
+        // 使用iOS 16引入的NavigationStack替代旧的NavigationView
+        if #available(iOS 16.0, *) {
+            return NavigationStack {
+                self
+            }
+        } else {
+            // 对于iOS 16以下版本回退到NavigationView
+            return NavigationView {
+                self
+            }
+            .navigationViewStyle(.stack)
+        }
+    }
+}
+
+// MARK: - ZoomableScrollView (Helper for Image Zooming)
+struct ZoomableScrollView<Content: View>: UIViewRepresentable {
+    private var content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    func makeUIView(context: Context) -> UIScrollView {
+        // Set up the UIScrollView
+        let scrollView = UIScrollView()
+        scrollView.delegate = context.coordinator // for viewForZooming(in:)
+        scrollView.maximumZoomScale = 4.0 // Allow up to 4x zoom
+        scrollView.minimumZoomScale = 1.0
+        scrollView.bouncesZoom = true
+        scrollView.showsHorizontalScrollIndicator = false
+        scrollView.showsVerticalScrollIndicator = false
+
+        // Create a UIHostingController to hold the SwiftUI content
+        let hostedView = context.coordinator.hostingController.view!
+        hostedView.translatesAutoresizingMaskIntoConstraints = true
+        hostedView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        hostedView.frame = scrollView.bounds
+        hostedView.backgroundColor = .clear // Make hosting view transparent
+        scrollView.addSubview(hostedView)
+        scrollView.backgroundColor = .clear // Make scroll view transparent
+
+        return scrollView
+    }
+
+    func makeCoordinator() -> Coordinator {
+        return Coordinator(hostingController: UIHostingController(rootView: self.content))
+    }
+
+    func updateUIView(_ uiView: UIScrollView, context: Context) {
+        // Update the hosting controller's SwiftUI content
+        context.coordinator.hostingController.rootView = self.content
+        // Ensure the hosted view fills the scroll view
+        assert(context.coordinator.hostingController.view.superview == uiView)
+    }
+
+    // MARK: - Coordinator
+    class Coordinator: NSObject, UIScrollViewDelegate {
+        var hostingController: UIHostingController<Content>
+
+        init(hostingController: UIHostingController<Content>) {
+            self.hostingController = hostingController
+        }
+
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+            // Return the view hosting the SwiftUI content for zooming
+            return hostingController.view
+        }
+
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            // Optionally center the content if it's smaller than the scroll view bounds
+            centerContent(in: scrollView)
+        }
+
+        func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+            // You can add logic here if needed after zooming finishes
+        }
+        
+        private func centerContent(in scrollView: UIScrollView) {
+             guard let contentView = hostingController.view else { return }
+             let boundsSize = scrollView.bounds.size
+             var frameToCenter = contentView.frame
+
+             // Center horizontally
+             if frameToCenter.size.width < boundsSize.width {
+                 frameToCenter.origin.x = (boundsSize.width - frameToCenter.size.width) / 2
+             } else {
+                 frameToCenter.origin.x = 0
+             }
+
+             // Center vertically
+             if frameToCenter.size.height < boundsSize.height {
+                 frameToCenter.origin.y = (boundsSize.height - frameToCenter.size.height) / 2
+             } else {
+                 frameToCenter.origin.y = 0
+             }
+
+             contentView.frame = frameToCenter
+         }
+    }
+}
+
+// MARK: - Image Detail View (Fullscreen)
 struct ImageDetailView: View {
-    let currentPhoto: Photo
-    let photoIndex: Int
+    @Environment(\.presentationMode) var presentationMode // To dismiss the view
+    @State var photoIndex: Int
     let allPhotos: [Photo]
     let onDelete: (Photo) -> Void
-    
-    // MARK: - State & Environment
-    @Environment(\.presentationMode) var presentationMode
-    @State private var scale: CGFloat = 1.0
-    @State private var lastScale: CGFloat = 1.0
-    @State private var offset = CGSize.zero
-    @State private var lastOffset = CGSize.zero
-    @State private var showingDeleteAlert = false
-    @State private var showingControls = true
-    @State private var viewHasAppeared = false
-    @State private var renderCount = 0 // Keep for potential debug/unique IDs
-    @State private var currentIndex: Int
-    @State private var draggingOffset: CGFloat = 0 // Maybe related to dismissal gesture, keep for now
-    
-    // MARK: - Image Cache
-    // Use a simple dictionary cache for this example. NSCache is better for memory management.
-    // @State private var imageCache = NSCache<UUID, UIImage>() // Correct way with NSCache
-    @StateObject private var imageCacheWrapper = ImageCacheWrapper() // Wrap NSCache in ObservableObject
-    @ObservedObject var thumbnailCacheManager: ThumbnailCacheManager // Receive the thumbnail cache manager
-
-    init(currentPhoto: Photo, photoIndex: Int, allPhotos: [Photo], onDelete: @escaping (Photo) -> Void, thumbnailCacheManager: ThumbnailCacheManager) {
-        self.currentPhoto = currentPhoto
-        self.photoIndex = photoIndex
-        self.allPhotos = allPhotos
-        self.onDelete = onDelete
-        self._currentIndex = State(initialValue: photoIndex)
-        self.thumbnailCacheManager = thumbnailCacheManager // Store thumbnail manager
-        // imageCache.countLimit = 10 // Example: Limit cache size
-    }
-    
-    var body: some View {
-        GeometryReader { geometry in
-            ZStack {
-                Color.black.edgesIgnoringSafeArea(.all)
-                
-                if scale <= 1.0 {
-                    TabView(selection: $currentIndex) {
-                        ForEach(0..<allPhotos.count, id: \.self) { index in
-                            SingleImageView(
-                                photo: allPhotos[index],
-                                scale: index == currentIndex ? $scale : .constant(1.0),
-                                offset: index == currentIndex ? $offset : .constant(.zero),
-                                lastScale: $lastScale,
-                                lastOffset: $lastOffset,
-                                isCurrentView: index == currentIndex,
-                                imageCache: imageCacheWrapper.cache, // Pass the full image cache down
-                                thumbnailCacheManager: thumbnailCacheManager // Pass the thumbnail cache manager
-                            )
-                            .tag(index)
-                            .id("tabview-item-\(index)-\(renderCount)")
-                        }
-                    }
-                    .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
-                    .id("tab-view-\(currentIndex)-\(renderCount)")
-                    .onChange(of: currentIndex) { newIndex in
-                        scale = 1.0
-                        offset = .zero
-                        lastOffset = .zero
-                        renderCount += 1
-                        appLog("切换到图片 \(allPhotos[newIndex].fileName)")
-                        DispatchQueue.global(qos: .userInitiated).async {
-                            _ = PhotoManager.shared.loadFullImage(for: allPhotos[newIndex])
-                        }
-                    }
-                } else {
-                    SingleImageView(
-                        photo: allPhotos[currentIndex],
-                        scale: $scale,
-                        offset: $offset,
-                        lastScale: $lastScale,
-                        lastOffset: $lastOffset,
-                        isCurrentView: true,
-                        imageCache: imageCacheWrapper.cache, // Pass the full image cache down
-                        thumbnailCacheManager: thumbnailCacheManager // Pass the thumbnail cache manager
-                    )
-                    .id("zoomed-view-\(currentIndex)-\(renderCount)")
-                }
-                
-                // 控制栏
-                if showingControls {
-                    VStack {
-                        HStack {
-                            Button(action: {
-                                appLog("关闭按钮被点击")
-                                presentationMode.wrappedValue.dismiss()
-                            }) {
-                                Image(systemName: "xmark")
-                                    .font(.system(size: 20, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(width: 36, height: 36)
-                                    .background(Color.black.opacity(0.6))
-                                    .clipShape(Circle())
-                            }
-                            .padding(.leading, 16)
-                            
-                            Spacer()
-                            
-                            Button(action: {
-                                shareImage()
-                            }) {
-                                Image(systemName: "square.and.arrow.up")
-                                    .font(.system(size: 18, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(width: 36, height: 36)
-                                    .background(Color.black.opacity(0.6))
-                                    .clipShape(Circle())
-                            }
-                            
-                            Button(action: {
-                                showingDeleteAlert = true
-                            }) {
-                                Image(systemName: "trash")
-                                    .font(.system(size: 18, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(width: 36, height: 36)
-                                    .background(Color.black.opacity(0.6))
-                                    .clipShape(Circle())
-                            }
-                            .padding(.trailing, 16)
-                        }
-                        .padding(.top, getSafeAreaTop())
-                        
-                        Spacer()
-                        
-                        HStack(spacing: 6) {
-                            ForEach(0..<min(allPhotos.count, 9), id: \.self) { i in
-                                Circle()
-                                    .fill(i == currentIndex ? Color.white : Color.white.opacity(0.4))
-                                    .frame(width: 6, height: 6)
-                            }
-                            
-                            if allPhotos.count > 9 {
-                                Text("+\(allPhotos.count - 9)")
-                                    .font(.caption2)
-                                    .foregroundColor(.white)
-                            }
-                        }
-                        .padding(.bottom, 20)
-                    }
-                }
-            }
-            .gesture(scale > 1.0 ? nil : TapGesture().onEnded {
-                withAnimation {
-                    showingControls.toggle()
-                }
-            })
-            .addSwipeGesture(
-                onSwipeLeft: {
-                    if scale <= 1.0 && currentIndex < allPhotos.count - 1 {
-                        withAnimation {
-                            currentIndex += 1
-                        }
-                    }
-                },
-                onSwipeRight: {
-                    if scale <= 1.0 && currentIndex > 0 {
-                        withAnimation {
-                            currentIndex -= 1
-                        }
-                    }
-                }
-            )
-        }
-        .alert(isPresented: $showingDeleteAlert) {
-            Alert(
-                title: Text("删除照片"),
-                message: Text("确定要删除此照片吗？此操作不可恢复。"),
-                primaryButton: .destructive(Text("删除")) {
-                    let photoToDelete = allPhotos[currentIndex]
-                    onDelete(photoToDelete)
-                    if allPhotos.count <= 1 {
-                        presentationMode.wrappedValue.dismiss()
-                    }
-                },
-                secondaryButton: .cancel(Text("取消"))
-            )
-        }
-        .onAppear {
-            appLog("ImageDetailView生命周期 - onAppear - 开始")
-        }
-        .task {
-            appLog("ImageDetailView开始task预加载相邻图片")
-            preloadAdjacentImages()
-        }
-    }
-    
-    private func preloadAdjacentImages() {
-        let current = currentIndex
-        let total = allPhotos.count
-        // Define the preloading window (e.g., 2 images before and after)
-        let preloadWindow = 2
-        let rangeStart = max(0, current - preloadWindow)
-        let rangeEnd = min(total - 1, current + preloadWindow)
-
-        appLog("Preloading images for indices \(rangeStart)...\(rangeEnd)")
-
-        for index in rangeStart...rangeEnd {
-            if index == current { continue } // Skip current image
-            
-            let photoToPreload = allPhotos[index]
-            let photoId = photoToPreload.id
-            
-            // Check cache first
-            if imageCacheWrapper.cache.object(forKey: photoId as NSUUID) == nil {
-                 appLog("Preloading: Cache miss for \(photoToPreload.fileName) at index \(index). Starting background load.")
-                 // Start background task to load and cache
-                 Task.detached(priority: .utility) {
-                     let loadedImage = PhotoManager.shared.loadFullImage(for: photoToPreload)
-                     if let image = loadedImage {
-                         // Store in cache on main thread or ensure NSCache is thread-safe (it is)
-                          // await MainActor.run { // Not strictly necessary for NSCache set
-                         imageCacheWrapper.cache.setObject(image, forKey: photoId as NSUUID)
-                         appLog("Preloading: Successfully loaded and cached \(photoToPreload.fileName)")
-                          // }
-                     } else {
-                         appLog("Preloading: Failed to load \(photoToPreload.fileName)")
-                     }
-                 }
-            } else {
-                 appLog("Preloading: Cache hit for \(photoToPreload.fileName) at index \(index). No load needed.")
-            }
-        }
-    }
-    
-    private func shareImage() {
-        let photo = allPhotos[currentIndex]
-        let imageToShare: UIImage?
-        if let loadedImage = PhotoManager.shared.loadFullImage(for: photo) {
-            imageToShare = loadedImage
-            appLog("shareImage: Using loaded full image for \(photo.fileName)")
-        } else {
-            // Attempt to load the thumbnail as a fallback
-            appLog("shareImage: Failed to load full image for \(photo.fileName), attempting to load thumbnail.")
-            imageToShare = PhotoManager.shared.getThumbnail(for: photo)
-            if imageToShare == nil {
-                 appLog("shareImage: Failed to load thumbnail as well for \(photo.fileName). Sharing will likely fail or use no image.")
-            }
-        }
-        
-        // Only proceed if we have an image
-        guard let finalImageToShare = imageToShare else {
-             appLog("shareImage: No image available to share for \(photo.fileName).")
-             // Optionally show an alert to the user
-             return
-        }
-        
-        let activityVC = UIActivityViewController(activityItems: [finalImageToShare], applicationActivities: nil)
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let window = windowScene.windows.first,
-           let rootViewController = window.rootViewController {
-            activityVC.popoverPresentationController?.sourceView = window
-            // Set sourceRect to avoid crashes on iPad
-             activityVC.popoverPresentationController?.sourceRect = CGRect(x: window.bounds.midX, y: window.bounds.midY, width: 0, height: 0) 
-             activityVC.popoverPresentationController?.permittedArrowDirections = [] // No arrow for centered popover
-
-            rootViewController.present(activityVC, animated: true)
-            appLog("shareImage: Presented activity view controller for \(photo.fileName)")
-        } else {
-             appLog("shareImage: Could not find root view controller to present share sheet.")
-        }
-    }
-    
-    private func getSafeAreaTop() -> CGFloat {
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let window = windowScene.windows.first {
-            return window.safeAreaInsets.top
-        }
-        return 16
-    }
-}
-
-// Wrapper for NSCache to use with @StateObject
-class ImageCacheWrapper: ObservableObject {
-    let cache = NSCache<NSUUID, UIImage>()
-    init() {
-        // Configure cache limits (Significantly Reduced for Full Images)
-        cache.countLimit = 5 // Keep only a few full-res decoded images
-        cache.totalCostLimit = 1024 * 1024 * 80 // Limit full image memory cache to ~80MB (adjust based on typical image size)
-        appLog("ImageCacheWrapper initialized. Count limit: \(cache.countLimit), Cost limit: \(cache.totalCostLimit)")
-    }
-}
-
-// 单张图片视图组件
-struct SingleImageView: View {
-    let photo: Photo
-    @Binding var scale: CGFloat
-    @Binding var offset: CGSize
-    @Binding var lastScale: CGFloat
-    @Binding var lastOffset: CGSize
-    let isCurrentView: Bool
-    let imageCache: NSCache<NSUUID, UIImage> // Receive the **full image** cache
-    @ObservedObject var thumbnailCacheManager: ThumbnailCacheManager // Receive the thumbnail cache manager
+    let thumbnailCacheManager: ThumbnailCacheManager
 
     @State private var fullImage: UIImage? = nil
-    @State private var thumbnailImage: UIImage? = nil // State for thumbnail
-    @State private var isLoading: Bool = false
-    @State private var loadTaskId: UUID? = nil // Track the loading task
+    @State private var isLoadingFullImage = true
+    @State private var barsVisible = true // State to control bar visibility
+    @State private var showPhotoInfo = false // 控制照片信息弹窗显示
+    @State private var dateTaken: Date? = nil // 存储照片拍摄时间
 
-    // Removed renderCount as it might not be needed with caching
-    
-    init(photo: Photo, scale: Binding<CGFloat>, offset: Binding<CGSize>, lastScale: Binding<CGFloat>, lastOffset: Binding<CGSize>, isCurrentView: Bool, imageCache: NSCache<NSUUID, UIImage>, thumbnailCacheManager: ThumbnailCacheManager) {
-        self.photo = photo
-        self._scale = scale
-        self._offset = offset
-        self._lastScale = lastScale
-        self._lastOffset = lastOffset
-        self.isCurrentView = isCurrentView
-        self.imageCache = imageCache
-        self.thumbnailCacheManager = thumbnailCacheManager // Store thumbnail manager
-
-        // Initialize with cached full image if available
-        self._fullImage = State(initialValue: imageCache.object(forKey: photo.id as NSUUID))
-
-        // Initialize with thumbnail from thumbnail cache manager (synchronous check)
-        self._thumbnailImage = State(initialValue: thumbnailCacheManager.memoryCache.object(forKey: photo.id as NSUUID))
-
-        appLog("SingleImageView init: \(photo.fileName), isCurrent: \(isCurrentView), fullImage cached: \(self.fullImage != nil), thumbnail cached: \(self.thumbnailImage != nil)")
-
-        // If thumbnail wasn't in memory cache, try fetching it (covers disk cache or generation)
-        if self.thumbnailImage == nil {
-            // Set loading true only if full image also isn't available
-            if self.fullImage == nil {
-                 self._isLoading = State(initialValue: true) 
-            }
-            fetchThumbnailIfNeeded()
+    // Computed property for the current photo based on index
+    private var currentPhoto: Photo {
+        guard photoIndex >= 0 && photoIndex < allPhotos.count else {
+            // This should ideally not happen due to checks elsewhere, but provides a fallback
+            appLog("Error: photoIndex \(photoIndex) is out of bounds (\(allPhotos.count)) in computed currentPhoto. Returning first available photo.")
+            // Handle potential empty array gracefully
+            return allPhotos.first ?? Photo(id: UUID(), albumId: UUID(), fileName: "error", createdAt: Date()) // Placeholder
         }
+        return allPhotos[photoIndex]
     }
-    
+
+    // Formatter for the date display
+    private var dateFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }
+
     var body: some View {
-        let _ = appLog("SingleImageView body: \(photo.fileName), isCurrent: \(isCurrentView), fullImage is nil: \(fullImage == nil), thumbnail is nil: \(thumbnailImage == nil), isLoading: \(isLoading)")
+        ZStack {
+            Color.black.ignoresSafeArea()
 
-        return ZStack {
-             // Determine which image to display
-             let imageToShow: UIImage? = fullImage ?? thumbnailImage
-             
-             if let displayImage = imageToShow {
-                  Image(uiImage: displayImage)
-                      .resizable()
-                      .interpolation(fullImage != nil ? .high : .medium) // Use high quality only for full image
-                      .scaledToFit()
-                      .clipped()
-                      .scaleEffect(scale)
-                      .offset(offset)
-                      .id("image-\(photo.id)-\(fullImage != nil ? "full" : "thumb")") // More stable ID
-                      .simultaneousGesture(isCurrentView ? doubleTapGesture : nil)
-                      .simultaneousGesture(isCurrentView ? magnificationGesture : nil)
-                      .simultaneousGesture(isCurrentView && scale > 1.0 ? dragGesture : nil, including: scale > 1.0 ? .all : .subviews)
-             } else {
-                  // Fallback placeholder if even thumbnail isn't available
-                  Rectangle()
-                      .fill(Color.secondary.opacity(0.2))
-                      .id("placeholder-\(photo.id)")
-             }
-            
-             // Show progress only if loading is active AND *neither* full image nor thumbnail is loaded yet
-             if isLoading && fullImage == nil && thumbnailImage == nil {
-                 ProgressView()
-                     .scaleEffect(1.5)
-                     // .foregroundColor(.white) // Adjust color if needed based on background
-             }
-        }
-        .task(id: photo.id) { // Task tied to photo.id
-            appLog("SingleImageView .task: \(photo.fileName), isCurrent: \(isCurrentView) - Task started")
-            // Only load if it's the current view and the full image hasn't been loaded yet
-            if isCurrentView && fullImage == nil {
-                appLog("SingleImageView .task: \(photo.fileName) - Condition met (current, no full img), calling loadFullSizeImage")
-                await loadFullSizeImage()
-            } else {
-                 appLog("SingleImageView .task: \(photo.fileName) - Condition NOT met (isCurrent: \(isCurrentView), fullImage cached/loaded: \(fullImage != nil))")
-            }
-        }
-        .onChange(of: isCurrentView) { becameCurrent in
-            appLog("SingleImageView onChange(isCurrentView): \(photo.fileName), becameCurrent: \(becameCurrent), fullImage is nil: \(fullImage == nil)")
-            if becameCurrent && fullImage == nil {
-                Task {
-                    appLog("SingleImageView onChange(isCurrentView): \(photo.fileName) - Condition met, calling loadFullSizeImage")
-                    await loadFullSizeImage()
-                    appLog("SingleImageView onChange(isCurrentView): \(photo.fileName) - loadFullSizeImage returned")
+            if isLoadingFullImage {
+                ProgressView()
+                    .scaleEffect(1.5)
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+            } else if let image = fullImage {
+                ZoomableScrollView {
+                    Image(uiImage: image)
+                        .resizable()
+                        .scaledToFit()
                 }
-            } else if !becameCurrent {
-                 // Optional: Cancel loading task if view is no longer current?
-                 // Requires managing the Task handle. For now, let preloading handle this.
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        barsVisible.toggle()
+                    }
+                }
+            } else {
+                VStack {
+                    Image(systemName: "photo")
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 100, height: 100)
+                        .foregroundColor(.gray)
+                    Text("无法加载图片")
+                        .foregroundColor(.white)
+                }
+            }
+
+            // Top Bar
+            if barsVisible {
+                VStack {
+                    HStack {
+                        Button { presentationMode.wrappedValue.dismiss() } label: {
+                            Image(systemName: "chevron.left").font(.title2).foregroundColor(.white).padding()
+                        }
+                        Spacer()
+                        // 使用拍摄时间(如果可用)，否则使用文件创建时间
+                        Text(dateTaken ?? currentPhoto.createdAt, formatter: dateFormatter)
+                            .font(.caption)
+                            .foregroundColor(.white)
+                            .padding(.vertical, 5).padding(.horizontal, 10)
+                        Spacer()
+                        Button { 
+                            showPhotoInfo = true 
+                        } label: {
+                            Image(systemName: "info.circle").font(.title2).foregroundColor(.white).padding()
+                        }
+                    }
+                    .padding(.top, UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0)
+                    .background(Material.ultraThinMaterial.opacity(0.8))
+                    Spacer()
+                }
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
+            // Bottom Bar
+            if barsVisible {
+                VStack {
+                    Spacer()
+                    HStack(spacing: 30) {
+                        Spacer()
+                        Button { sharePhoto() } label: {
+                            VStack { Image(systemName: "square.and.arrow.up").font(.title2); Text("分享").font(.caption) }.foregroundColor(.white)
+                        }
+                        Spacer()
+                        Button {
+                            // Use computed currentPhoto
+                            onDelete(currentPhoto)
+                            presentationMode.wrappedValue.dismiss()
+                        } label: {
+                            VStack { Image(systemName: "trash").font(.title2); Text("删除").font(.caption) }.foregroundColor(.red)
+                        }
+                        Spacer()
+                        Button { print("More button tapped for \(currentPhoto.fileName)") } label: {
+                             VStack { Image(systemName: "ellipsis.circle").font(.title2); Text("更多").font(.caption) }.foregroundColor(.white)
+                        }
+                        Spacer()
+                    }
+                    .padding(.bottom, UIApplication.shared.windows.first?.safeAreaInsets.bottom ?? 20)
+                    .padding(.horizontal).padding(.top, 15)
+                    .frame(maxWidth: .infinity)
+                    .background(Material.ultraThinMaterial.opacity(0.8))
+                }
+                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .onAppear { // Also try loading on appear if needed
-             appLog("SingleImageView onAppear: \(photo.fileName), isCurrent: \(isCurrentView), fullImage is nil: \(fullImage == nil)")
-             if isCurrentView && fullImage == nil && !isLoading {
-                 // Attempt load full image if it appears as current and isn't already loaded/loading
-                 Task {
-                     await loadFullSizeImage()
-                 }
-             }
-             // Ensure thumbnail is loaded if somehow missed during init
-             if thumbnailImage == nil {
-                 fetchThumbnailIfNeeded()
-                 // Logging now happens inside fetchThumbnailIfNeeded
-             }
+        .gesture(DragGesture().onEnded { value in handleSwipe(translation: value.translation) })
+        .onAppear {
+             appLog("ImageDetailView onAppear - Index: \(photoIndex), Photo: \(currentPhoto.fileName)")
+            loadFullImage()
+            loadPhotoMetadata()
+        }
+        .onChange(of: photoIndex) { newIndex in
+             // No need to update currentPhoto state here anymore
+             appLog("ImageDetailView onChange photoIndex: \(newIndex)")
+             loadFullImage() // Just trigger loading for the new index
+             loadPhotoMetadata() // 加载新照片的元数据
+        }
+        .statusBar(hidden: !barsVisible)
+        .sheet(isPresented: $showPhotoInfo) {
+            photoInfoView
         }
     }
     
-    private func loadFullSizeImage() async {
-        // Avoid starting a new load if one is already in progress for this image instance
-         guard loadTaskId == nil else {
-             appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Load already in progress (task \(loadTaskId!)). Skipping.")
-             return
-         }
-         
-         // Check cache again just before loading (might have been populated by preloading)
-         if let cachedImage = imageCache.object(forKey: photo.id as NSUUID) {
-             if self.fullImage == nil { // Only update if not already set
-                 await MainActor.run {
-                      appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Found in cache just before loading. Setting fullImage.")
-                      self.fullImage = cachedImage
-                      self.isLoading = false // Ensure loading indicator is off
-                 }
-             } else {
-                  appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Found in cache, but fullImage already set. No state change needed.")
-             }
-             return // Don't proceed to load from disk
-         }
-         
-         let taskId = UUID()
-         loadTaskId = taskId
-         
-         await MainActor.run {
-             appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Cache miss. Setting isLoading = true. Task ID: \(taskId)")
-             self.isLoading = true
-         }
-        
-        appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Starting Task.detached for PhotoManager")
-        
-        let loadedImage = await Task.detached(priority: .userInitiated) { () -> UIImage? in
-            appLog("SingleImageView loadFullSizeImage (Task.detached): \(photo.fileName) - Calling PhotoManager.loadFullImage")
-            let result = PhotoManager.shared.loadFullImage(for: photo)
-            appLog("SingleImageView loadFullSizeImage (Task.detached): \(photo.fileName) - PhotoManager.loadFullImage returned \(result == nil ? "nil" : "image")")
-            return result
-        }.value
-        
-        // Check if the task is still the current one before updating state
-         guard loadTaskId == taskId else {
-             appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Task \(taskId) is stale (current task is \(loadTaskId?.uuidString ?? "nil")). Discarding result.")
-             // Don't update state if a newer task has started (e.g., view re-appeared)
-             return
-         }
-        
-        appLog("SingleImageView loadFullSizeImage: \(photo.fileName) - Task \(taskId) finished, preparing MainActor update")
-        
-        await MainActor.run {
-            appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - Updating state for task \(taskId)")
-            if let image = loadedImage {
-                appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - Success, setting fullImage and caching.")
-                self.fullImage = image
-                self.isLoading = false // Turn off loading indicator upon success
-                // Cache the loaded image
-                imageCache.setObject(image, forKey: photo.id as NSUUID)
-                 // Consider cost if using totalCostLimit in NSCache
-                 // imageCache.setObject(image, forKey: photo.id as NSUUID, cost: image.diskSize) // Need a way to estimate cost
-            } else {
-                appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - Failed to load image")
-                // Keep showing thumbnail or placeholder
-                // If full image fails, ensure loading indicator is off ONLY if thumbnail is available
-                if self.thumbnailImage != nil { 
-                     self.isLoading = false
-                }
-            }
-            self.loadTaskId = nil // Clear task ID after completion/failure
-            appLog("SingleImageView loadFullSizeImage (MainActor): \(photo.fileName) - State update complete, fullImage is nil: \(self.fullImage == nil), isLoading: \(self.isLoading)")
-        }
-    }
-    
-    // 手势定义
-    private var magnificationGesture: some Gesture {
-        MagnificationGesture()
-            .onChanged { value in
-                let delta = value / lastScale
-                lastScale = value
-                // 限制缩放范围
-                let newScale = scale * delta
-                scale = min(max(newScale, 0.8), 5) // 允许缩小一点
-            }
-            .onEnded { _ in
-                lastScale = 1.0
-                // 如果缩放小于1，弹回1
-                if scale < 1.0 {
-                    withAnimation {
-                        scale = 1.0
-                        offset = .zero
-                        lastOffset = .zero
+    // 照片信息弹窗视图
+    private var photoInfoView: some View {
+        NavigationView {
+            List {
+                Section(header: Text("照片信息")) {
+                    HStack {
+                        Text("文件名")
+                        Spacer()
+                        Text(currentPhoto.fileName)
+                            .foregroundColor(.gray)
+                    }
+                    
+                    HStack {
+                        Text("拍摄时间")
+                        Spacer()
+                        Text(dateTaken ?? currentPhoto.createdAt, formatter: dateFormatter)
+                            .foregroundColor(.gray)
+                    }
+                    
+                    HStack {
+                        Text("尺寸")
+                        Spacer()
+                        Text(PhotoManager.shared.getPhotoSizeString(for: currentPhoto))
+                            .foregroundColor(.gray)
+                    }
+                    
+                    HStack {
+                        Text("文件大小")
+                        Spacer()
+                        Text(PhotoManager.shared.getPhotoFileSize(for: currentPhoto))
+                            .foregroundColor(.gray)
                     }
                 }
             }
+            .listStyle(InsetGroupedListStyle())
+            .navigationBarTitle("照片详情", displayMode: .inline)
+            .navigationBarItems(trailing: Button("完成") {
+                showPhotoInfo = false
+            })
+        }
     }
-    
-    private var dragGesture: some Gesture {
-        DragGesture()
-            .onChanged { value in
-                if scale > 1 {
-                    offset = CGSize(
-                        width: lastOffset.width + value.translation.width / scale, // 根据缩放调整拖动
-                        height: lastOffset.height + value.translation.height / scale
-                    )
-                }
+
+    // 加载照片元数据
+    private func loadPhotoMetadata() {
+        Task {
+            // 获取照片拍摄时间
+            let date = PhotoManager.shared.getPhotoDateTaken(for: currentPhoto)
+            await MainActor.run {
+                self.dateTaken = date
             }
-            .onEnded { value in
-                lastOffset = offset
-                // 添加边界检查，防止图片拖出屏幕太多 (可选)
-                // ... 边界检查逻辑 ...
-            }
+        }
     }
-    
-    private var doubleTapGesture: some Gesture {
-        TapGesture(count: 2)
-            .onEnded { 
-                withAnimation(.spring()) {
-                    if scale > 1.0 {
-                        scale = 1.0
-                        offset = .zero
-                        lastOffset = .zero
+
+    // Updated function to load the full-resolution image based on photoIndex
+    private func loadFullImage() {
+        // Ensure index is valid before proceeding
+        guard photoIndex >= 0 && photoIndex < allPhotos.count else {
+            appLog("loadFullImage Error: photoIndex \(photoIndex) out of bounds (\(allPhotos.count)). Cannot load image.")
+            isLoadingFullImage = false // Stop loading indicator
+            fullImage = nil // Ensure no stale image is shown
+            return
+        }
+
+        let photoToLoad = allPhotos[photoIndex] // Get the correct photo using the current index
+        appLog("loadFullImage: Attempting to load index \(photoIndex), photo: \(photoToLoad.fileName)")
+
+        isLoadingFullImage = true
+        fullImage = nil
+
+        Task.detached(priority: .userInitiated) {
+            let loadedImage = await PhotoManager.shared.loadFullImage(for: photoToLoad) // Pass the correct photo object
+            await MainActor.run {
+                // Double-check if the index is still the same when the load finishes,
+                // in case the user swiped quickly multiple times.
+                if self.photoIndex < self.allPhotos.count && self.allPhotos[self.photoIndex].id == photoToLoad.id {
+                    if let img = loadedImage {
+                        self.fullImage = img
+                        appLog("loadFullImage: Successfully loaded for index \(self.photoIndex), photo: \(photoToLoad.fileName)")
                     } else {
-                        // 双击放大到固定倍数或适应屏幕
-                        scale = 2.5 
+                        appLog("loadFullImage: Failed to load full image for index \(self.photoIndex), photo: \(photoToLoad.fileName)")
+                        // Keep fullImage nil
                     }
+                     self.isLoadingFullImage = false
+                } else {
+                     appLog("loadFullImage: Load finished for index \(self.photoIndex), photo: \(photoToLoad.fileName), but view is now showing a different photo (\(self.photoIndex)). Discarding result.")
+                     // Don't update the UI if the index has changed since loading started
+                     // isLoadingFullImage might still need to be set to false if no other load is pending,
+                     // but it will be handled by the subsequent load triggered by onChange.
                 }
             }
+        }
     }
 
-    // Helper function to fetch thumbnail using the manager
-    private func fetchThumbnailIfNeeded() {
-        guard thumbnailImage == nil else { return } // Don't fetch if already loaded
-        
-        // Set isLoading if fullImage is also nil
-        if fullImage == nil && !isLoading {
-            isLoading = true
-        }
-        
-        let photoID = photo.id // Capture photo ID for logging
-        appLog("SingleImageView fetchThumbnailIfNeeded: Requesting thumbnail for \(photoID) from manager")
-        
-        // Remove capture list for struct self. Closure captures a copy.
-        thumbnailCacheManager.getThumbnail(for: photo) { image in 
-            // Updates will be applied to the view's state if it still exists.
-            Task { @MainActor in
-                if let img = image {
-                    // Check again in case it was loaded by another means concurrently
-                    // Accessing self.thumbnailImage here refers to the state associated with this view instance.
-                    if self.thumbnailImage == nil { 
-                        self.thumbnailImage = img
-                        appLog("SingleImageView fetchThumbnailIfNeeded: Thumbnail loaded for \(photoID)")
-                    }
-                    // Turn off loading indicator once thumbnail is available, even if full isn't yet
-                    self.isLoading = false 
-                } else {
-                    appLog("SingleImageView fetchThumbnailIfNeeded: Failed to load thumbnail for \(photoID)")
-                    // If thumbnail fails, stop the loading indicator for now.
-                    // If full image load also fails later, it might remain blank, which is acceptable.
-                    self.isLoading = false 
-                }
+    // Function to handle swipe gestures for navigation
+    private func handleSwipe(translation: CGSize) {
+        let swipeThreshold: CGFloat = 50
+
+        if translation.width < -swipeThreshold { // Swipe Left
+            if photoIndex < allPhotos.count - 1 {
+                 appLog("Swipe detected: Left. Old index: \(photoIndex)")
+                photoIndex += 1 // This triggers onChange
+                 appLog("Swipe processed: Left. New index: \(photoIndex)")
+            }
+        } else if translation.width > swipeThreshold { // Swipe Right
+            if photoIndex > 0 {
+                 appLog("Swipe detected: Right. Old index: \(photoIndex)")
+                photoIndex -= 1 // This triggers onChange
+                 appLog("Swipe processed: Right. New index: \(photoIndex)")
             }
         }
+    }
+
+    // Function to handle the Share action
+    private func sharePhoto() {
+        // Use computed currentPhoto
+        let photoToShare = currentPhoto
+        guard let imageToShare = fullImage else {
+            appLog("Share failed: Full image not available for \(photoToShare.fileName).")
+            // Maybe try loading it? Or show an error?
+            // For now, just return.
+            return
+        }
+
+        let activityViewController = UIActivityViewController(activityItems: [imageToShare], applicationActivities: nil)
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let rootViewController = windowScene.windows.first?.rootViewController else {
+            appLog("Share failed: Could not find root view controller.")
+            return
+        }
+        rootViewController.present(activityViewController, animated: true, completion: nil)
+        appLog("Presenting share sheet for \(photoToShare.fileName)")
     }
 }
 
-// 添加修复SwiftUI的TabView手势冲突的扩展
-extension View {
-    func addSwipeGesture(onSwipeLeft: @escaping () -> Void, onSwipeRight: @escaping () -> Void) -> some View {
-        self.gesture(
-            DragGesture(minimumDistance: 20, coordinateSpace: .global)
-                .onEnded { value in
-                    let horizontalAmount = value.translation.width
-                    let verticalAmount = value.translation.height
+// MARK: - Swipe Gesture Extension (Already exists at the end of the file, removing the ZoomableScrollView from here)
+// extension View {
+//     func addSwipeGesture(onSwipeLeft: @escaping () -> Void, onSwipeRight: @escaping () -> Void) -> some View {
+//         self.gesture(
+//             DragGesture(minimumDistance: 20, coordinateSpace: .global)
+//                 .onEnded { value in
+//                     let horizontalAmount = value.translation.width
+//                     let verticalAmount = value.translation.height
                     
-                    if abs(horizontalAmount) > abs(verticalAmount) {
-                        if horizontalAmount < 0 {
-                            onSwipeLeft()
-                        } else {
-                            onSwipeRight()
-                        }
-                    }
-                }
-        )
+//                     if abs(horizontalAmount) > abs(verticalAmount) {
+//                         if horizontalAmount < 0 {
+//                             onSwipeLeft()
+//                         } else {
+//                             onSwipeRight()
+//                         }
+//                     }
+//                 }
+//         )
+//     }
+// }
+
+// MARK: - iOS 16 Conditional Modifiers
+extension View {
+    @ViewBuilder
+    func if16Available<Content: View>(_ transform: (Self) -> Content) -> some View {
+        if #available(iOS 16.0, *) {
+            transform(self)
+        } else {
+            self
+        }
     }
 }
 
