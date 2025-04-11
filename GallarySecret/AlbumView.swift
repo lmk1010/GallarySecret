@@ -514,6 +514,8 @@ struct CreateAlbumView: View {
 
 struct ProfileView: View {
     @Environment(\.colorScheme) var colorScheme
+    @State private var showingPasswordSettings = false
+    @State private var storageSize: String = "计算中..."
     
     var body: some View {
         NavigationView {
@@ -544,15 +546,19 @@ struct ProfileView: View {
                         HStack {
                             Label("存储空间", systemImage: "externaldrive.fill")
                             Spacer()
-                            Text("0.0 MB")
+                            Text(storageSize)
                                 .foregroundColor(.gray)
                         }
                         
-                        HStack {
-                            Label("安全设置", systemImage: "lock.shield")
-                            Spacer()
-                            Image(systemName: "chevron.right")
-                                .foregroundColor(.gray)
+                        Button(action: {
+                            showingPasswordSettings = true
+                        }) {
+                            HStack {
+                                Label("计算器密码", systemImage: "lock.shield")
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .foregroundColor(.gray)
+                            }
                         }
                     }
                     
@@ -569,7 +575,69 @@ struct ProfileView: View {
             }
             .navigationTitle("我的")
             .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
+            .sheet(isPresented: $showingPasswordSettings) {
+                PasswordSettingsView()
+            }
+            .onAppear {
+                calculateStorageSize()
+            }
         }
+    }
+    
+    private func calculateStorageSize() {
+        // 在后台线程计算存储空间
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fileManager = FileManager.default
+            let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let libraryPath = fileManager.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            
+            var totalSize: UInt64 = 0
+            
+            // 计算 Documents 目录大小
+            if let documentsSize = try? fileManager.allocatedSizeOfDirectory(at: documentsPath) {
+                totalSize += documentsSize
+            }
+            
+            // 计算 Library 目录大小
+            if let librarySize = try? fileManager.allocatedSizeOfDirectory(at: libraryPath) {
+                totalSize += librarySize
+            }
+            
+            // 在主线程更新 UI
+            DispatchQueue.main.async {
+                self.storageSize = formatFileSize(totalSize)
+            }
+        }
+    }
+    
+    private func formatFileSize(_ size: UInt64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: Int64(size))
+    }
+}
+
+// 扩展 FileManager 以计算目录大小
+extension FileManager {
+    func allocatedSizeOfDirectory(at url: URL) throws -> UInt64 {
+        var totalSize: UInt64 = 0
+        
+        let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .fileAllocatedSizeKey, .totalFileAllocatedSizeKey]
+        
+        let enumerator = self.enumerator(at: url, includingPropertiesForKeys: Array(resourceKeys), options: [.skipsHiddenFiles], errorHandler: { (_, error) -> Bool in
+            print("Error enumerating directory: \(error)")
+            return true
+        })!
+        
+        for case let fileURL as URL in enumerator {
+            let resourceValues = try fileURL.resourceValues(forKeys: resourceKeys)
+            if resourceValues.isRegularFile ?? false {
+                totalSize += UInt64(resourceValues.totalFileAllocatedSize ?? resourceValues.fileAllocatedSize ?? 0)
+            }
+        }
+        
+        return totalSize
     }
 }
 

@@ -656,7 +656,7 @@ struct PhotoGridView: View {
                         .padding(4)
                 }
                 .cornerRadius(6)
-                .animation(.easeInOut(duration: 0.15), value: selectedPhotoIDs.contains(photo.id))
+                .animation(.easeInOut(duration: 0.08), value: selectedPhotoIDs.contains(photo.id))
             }
         }
     }
@@ -1169,17 +1169,25 @@ struct ZoomableScrollView<Content: View>: UIViewRepresentable {
 
 // MARK: - Image Detail View (Fullscreen)
 struct ImageDetailView: View {
-    @Environment(\.presentationMode) var presentationMode // To dismiss the view
+    @Environment(\.presentationMode) var presentationMode
+    @Environment(\.colorScheme) var colorScheme
     @State var photoIndex: Int
     let allPhotos: [Photo]
     let onDelete: (Photo) -> Void
     let thumbnailCacheManager: ThumbnailCacheManager
 
     @State private var fullImage: UIImage? = nil
+    @State private var nextImage: UIImage? = nil
+    @State private var prevImage: UIImage? = nil
     @State private var isLoadingFullImage = true
-    @State private var barsVisible = true // State to control bar visibility
-    @State private var showPhotoInfo = false // 控制照片信息弹窗显示
-    @State private var dateTaken: Date? = nil // 存储照片拍摄时间
+    @State private var barsVisible = true
+    @State private var showPhotoInfo = false
+    @State private var dateTaken: Date? = nil
+    @State private var showDeleteAlert = false
+    @State private var dragOffset: CGFloat = 0
+    @State private var isDragging = false
+    @State private var targetOffset: CGFloat = 0
+    @State private var isAnimating = false
 
     // Computed property for the current photo based on index
     private var currentPhoto: Photo {
@@ -1202,17 +1210,112 @@ struct ImageDetailView: View {
 
     var body: some View {
         ZStack {
-            Color.black.ignoresSafeArea()
+            mainContentView
+            if barsVisible {
+                topBarView
+                bottomBarView
+            }
+        }
+        .gesture(
+            DragGesture()
+                .onChanged { value in
+                    isDragging = true
+                    dragOffset = value.translation.width
+                    
+                    // 计算目标偏移量，限制在屏幕宽度范围内
+                    let screenWidth = UIScreen.main.bounds.width
+                    let maxOffset = screenWidth * 0.5
+                    targetOffset = min(max(dragOffset, -maxOffset), maxOffset)
+                }
+                .onEnded { value in
+                    isDragging = false
+                    let screenWidth = UIScreen.main.bounds.width
+                    let velocity = value.predictedEndTranslation.width - value.translation.width
+                    let threshold: CGFloat = screenWidth * 0.3 // 30% 的屏幕宽度作为阈值
+                    
+                    // 根据拖动距离和速度决定是否切换图片
+                    let shouldSwitch = abs(dragOffset) > threshold || abs(velocity) > 500
+                    
+                    // 使用更平滑的动画
+                    withAnimation(.easeInOut(duration: 0.3)) {
+                        if shouldSwitch {
+                            if dragOffset < 0 && photoIndex < allPhotos.count - 1 {
+                                photoIndex += 1
+                                targetOffset = screenWidth
+                            } else if dragOffset > 0 && photoIndex > 0 {
+                                photoIndex -= 1
+                                targetOffset = -screenWidth
+                            }
+                        }
+                        // 无论是否切换，都平滑地回到初始位置
+                        dragOffset = 0
+                        targetOffset = 0
+                    }
+                }
+        )
+        .onAppear {
+            appLog("ImageDetailView onAppear - Index: \(photoIndex), Photo: \(currentPhoto.fileName)")
+            loadFullImage()
+            loadPhotoMetadata()
+            preloadAdjacentImages()
+        }
+        .onChange(of: photoIndex) { newIndex in
+            appLog("ImageDetailView onChange photoIndex: \(newIndex)")
+            loadFullImage()
+            loadPhotoMetadata()
+            preloadAdjacentImages()
+        }
+        .statusBar(hidden: !barsVisible)
+        .sheet(isPresented: $showPhotoInfo) {
+            photoInfoView
+        }
+        .alert("删除照片", isPresented: $showDeleteAlert) {
+            Button("删除", role: .destructive) {
+                onDelete(currentPhoto)
+                presentationMode.wrappedValue.dismiss()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("确定要删除这张照片吗？此操作将从应用内部删除照片，但不会影响系统相册。")
+        }
+    }
 
+    // MARK: - Subviews
+    private var mainContentView: some View {
+        Group {
             if isLoadingFullImage {
                 ProgressView()
                     .scaleEffect(1.5)
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
             } else if let image = fullImage {
-                ZoomableScrollView {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
+                ZStack {
+                    // 显示下一张图片（如果存在）
+                    if let nextImg = nextImage, dragOffset < 0 {
+                        ZoomableScrollView {
+                            Image(uiImage: nextImg)
+                                .resizable()
+                                .scaledToFit()
+                        }
+                        .offset(x: UIScreen.main.bounds.width + dragOffset)
+                    }
+                    
+                    // 显示上一张图片（如果存在）
+                    if let prevImg = prevImage, dragOffset > 0 {
+                        ZoomableScrollView {
+                            Image(uiImage: prevImg)
+                                .resizable()
+                                .scaledToFit()
+                        }
+                        .offset(x: -UIScreen.main.bounds.width + dragOffset)
+                    }
+                    
+                    // 显示当前图片
+                    ZoomableScrollView {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                    }
+                    .offset(x: dragOffset)
                 }
                 .onTapGesture {
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -1230,84 +1333,175 @@ struct ImageDetailView: View {
                         .foregroundColor(.white)
                 }
             }
-
-            // Top Bar
-            if barsVisible {
-                VStack {
-                    HStack {
-                        Button { presentationMode.wrappedValue.dismiss() } label: {
-                            Image(systemName: "chevron.left").font(.title2).foregroundColor(.white).padding()
-                        }
-                        Spacer()
-                        // 使用拍摄时间(如果可用)，否则使用文件创建时间
-                        Text(dateTaken ?? currentPhoto.createdAt, formatter: dateFormatter)
-                            .font(.caption)
-                            .foregroundColor(.white)
-                            .padding(.vertical, 5).padding(.horizontal, 10)
-                        Spacer()
-                        Button { 
-                            showPhotoInfo = true 
-                        } label: {
-                            Image(systemName: "info.circle").font(.title2).foregroundColor(.white).padding()
-                        }
-                    }
-                    .padding(.top, UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0)
-                    .background(Material.ultraThinMaterial.opacity(0.8))
-                    Spacer()
-                }
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
-
-            // Bottom Bar
-            if barsVisible {
-                VStack {
-                    Spacer()
-                    HStack(spacing: 30) {
-                        Spacer()
-                        Button { sharePhoto() } label: {
-                            VStack { Image(systemName: "square.and.arrow.up").font(.title2); Text("分享").font(.caption) }.foregroundColor(.white)
-                        }
-                        Spacer()
-                        Button {
-                            // Use computed currentPhoto
-                            onDelete(currentPhoto)
-                            presentationMode.wrappedValue.dismiss()
-                        } label: {
-                            VStack { Image(systemName: "trash").font(.title2); Text("删除").font(.caption) }.foregroundColor(.red)
-                        }
-                        Spacer()
-                        Button { print("More button tapped for \(currentPhoto.fileName)") } label: {
-                             VStack { Image(systemName: "ellipsis.circle").font(.title2); Text("更多").font(.caption) }.foregroundColor(.white)
-                        }
-                        Spacer()
-                    }
-                    .padding(.bottom, UIApplication.shared.windows.first?.safeAreaInsets.bottom ?? 20)
-                    .padding(.horizontal).padding(.top, 15)
-                    .frame(maxWidth: .infinity)
-                    .background(Material.ultraThinMaterial.opacity(0.8))
-                }
-                 .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .gesture(DragGesture().onEnded { value in handleSwipe(translation: value.translation) })
-        .onAppear {
-             appLog("ImageDetailView onAppear - Index: \(photoIndex), Photo: \(currentPhoto.fileName)")
-            loadFullImage()
-            loadPhotoMetadata()
-        }
-        .onChange(of: photoIndex) { newIndex in
-             // No need to update currentPhoto state here anymore
-             appLog("ImageDetailView onChange photoIndex: \(newIndex)")
-             loadFullImage() // Just trigger loading for the new index
-             loadPhotoMetadata() // 加载新照片的元数据
-        }
-        .statusBar(hidden: !barsVisible)
-        .sheet(isPresented: $showPhotoInfo) {
-            photoInfoView
         }
     }
-    
-    // 照片信息弹窗视图
+
+    private var topBarView: some View {
+        VStack {
+            HStack {
+                Button { presentationMode.wrappedValue.dismiss() } label: {
+                    Image(systemName: "chevron.left")
+                        .font(.title2)
+                        .foregroundColor(colorScheme == .dark ? .white : .black)
+                        .padding()
+                }
+                Spacer()
+                Text(dateTaken ?? currentPhoto.createdAt, formatter: dateFormatter)
+                    .font(.caption)
+                    .foregroundColor(colorScheme == .dark ? .white : .black)
+                    .padding(.vertical, 5)
+                    .padding(.horizontal, 10)
+                Spacer()
+                Button { 
+                    showPhotoInfo = true 
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.title2)
+                        .foregroundColor(colorScheme == .dark ? .white : .black)
+                        .padding()
+                }
+            }
+            .padding(.top, UIApplication.shared.windows.first?.safeAreaInsets.top ?? 0)
+            .background(colorScheme == .dark ? Color.black : Color.white)
+            Spacer()
+        }
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    private var bottomBarView: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                HStack(spacing: 50) {
+                    Button { sharePhoto() } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.title2)
+                            .foregroundColor(colorScheme == .dark ? .white : .black)
+                    }
+                    Button {
+                        showDeleteAlert = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.title2)
+                            .foregroundColor(.red)
+                    }
+                }
+                .padding(.trailing, 20)
+                .padding(.top, 15)
+            }
+            .padding(.bottom, UIApplication.shared.windows.first?.safeAreaInsets.bottom ?? 20)
+            .frame(maxWidth: .infinity)
+            .background(colorScheme == .dark ? Color.black : Color.white)
+        }
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+    }
+
+    // MARK: - Methods
+    private func loadPhotoMetadata() {
+        Task {
+            // 获取照片拍摄时间
+            let date = PhotoManager.shared.getPhotoDateTaken(for: currentPhoto)
+            await MainActor.run {
+                self.dateTaken = date
+            }
+        }
+    }
+
+    private func loadFullImage() {
+        // Ensure index is valid before proceeding
+        guard photoIndex >= 0 && photoIndex < allPhotos.count else {
+            appLog("loadFullImage Error: photoIndex \(photoIndex) out of bounds (\(allPhotos.count)). Cannot load image.")
+            isLoadingFullImage = false // Stop loading indicator
+            fullImage = nil // Ensure no stale image is shown
+            return
+        }
+
+        let photoToLoad = allPhotos[photoIndex] // Get the correct photo using the current index
+        appLog("loadFullImage: Attempting to load index \(photoIndex), photo: \(photoToLoad.fileName)")
+
+        isLoadingFullImage = true
+        fullImage = nil
+
+        Task.detached(priority: .userInitiated) {
+            let loadedImage = await PhotoManager.shared.loadFullImage(for: photoToLoad) // Pass the correct photo object
+            await MainActor.run {
+                // Double-check if the index is still the same when the load finishes,
+                // in case the user swiped quickly multiple times.
+                if self.photoIndex < self.allPhotos.count && self.allPhotos[self.photoIndex].id == photoToLoad.id {
+                    if let img = loadedImage {
+                        self.fullImage = img
+                        appLog("loadFullImage: Successfully loaded for index \(self.photoIndex), photo: \(photoToLoad.fileName)")
+                    } else {
+                        appLog("loadFullImage: Failed to load full image for index \(self.photoIndex), photo: \(photoToLoad.fileName)")
+                        // Keep fullImage nil
+                    }
+                     self.isLoadingFullImage = false
+                } else {
+                     appLog("loadFullImage: Load finished for index \(self.photoIndex), photo: \(photoToLoad.fileName), but view is now showing a different photo (\(self.photoIndex)). Discarding result.")
+                     // Don't update the UI if the index has changed since loading started
+                     // isLoadingFullImage might still need to be set to false if no other load is pending,
+                     // but it will be handled by the subsequent load triggered by onChange.
+                }
+            }
+        }
+    }
+
+    private func preloadAdjacentImages() {
+        // 预加载下一张图片
+        if photoIndex < allPhotos.count - 1 {
+            let nextPhoto = allPhotos[photoIndex + 1]
+            Task.detached(priority: .userInitiated) {
+                let loadedImage = await PhotoManager.shared.loadFullImage(for: nextPhoto)
+                await MainActor.run {
+                    self.nextImage = loadedImage
+                }
+            }
+        } else {
+            nextImage = nil
+        }
+        
+        // 预加载上一张图片
+        if photoIndex > 0 {
+            let prevPhoto = allPhotos[photoIndex - 1]
+            Task.detached(priority: .userInitiated) {
+                let loadedImage = await PhotoManager.shared.loadFullImage(for: prevPhoto)
+                await MainActor.run {
+                    self.prevImage = loadedImage
+                }
+            }
+        } else {
+            prevImage = nil
+        }
+    }
+
+    private func sharePhoto() {
+        guard let image = fullImage else { return }
+        
+        let activityViewController = UIActivityViewController(activityItems: [image], applicationActivities: nil)
+        
+        // 找到当前窗口场景
+        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+              let rootViewController = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+            return
+        }
+        
+        // 找到最顶层的视图控制器
+        var topController = rootViewController
+        while let presentedViewController = topController.presentedViewController {
+            topController = presentedViewController
+        }
+        
+        // 为 iPad 兼容性设置
+        if let popoverController = activityViewController.popoverPresentationController {
+            popoverController.sourceView = topController.view
+            popoverController.sourceRect = CGRect(x: topController.view.bounds.midX, y: topController.view.bounds.midY, width: 0, height: 0)
+            popoverController.permittedArrowDirections = []
+        }
+        
+        topController.present(activityViewController, animated: true, completion: nil)
+    }
+
     private var photoInfoView: some View {
         NavigationView {
             List {
@@ -1348,119 +1542,7 @@ struct ImageDetailView: View {
             })
         }
     }
-
-    // 加载照片元数据
-    private func loadPhotoMetadata() {
-        Task {
-            // 获取照片拍摄时间
-            let date = PhotoManager.shared.getPhotoDateTaken(for: currentPhoto)
-            await MainActor.run {
-                self.dateTaken = date
-            }
-        }
-    }
-
-    // Updated function to load the full-resolution image based on photoIndex
-    private func loadFullImage() {
-        // Ensure index is valid before proceeding
-        guard photoIndex >= 0 && photoIndex < allPhotos.count else {
-            appLog("loadFullImage Error: photoIndex \(photoIndex) out of bounds (\(allPhotos.count)). Cannot load image.")
-            isLoadingFullImage = false // Stop loading indicator
-            fullImage = nil // Ensure no stale image is shown
-            return
-        }
-
-        let photoToLoad = allPhotos[photoIndex] // Get the correct photo using the current index
-        appLog("loadFullImage: Attempting to load index \(photoIndex), photo: \(photoToLoad.fileName)")
-
-        isLoadingFullImage = true
-        fullImage = nil
-
-        Task.detached(priority: .userInitiated) {
-            let loadedImage = await PhotoManager.shared.loadFullImage(for: photoToLoad) // Pass the correct photo object
-            await MainActor.run {
-                // Double-check if the index is still the same when the load finishes,
-                // in case the user swiped quickly multiple times.
-                if self.photoIndex < self.allPhotos.count && self.allPhotos[self.photoIndex].id == photoToLoad.id {
-                    if let img = loadedImage {
-                        self.fullImage = img
-                        appLog("loadFullImage: Successfully loaded for index \(self.photoIndex), photo: \(photoToLoad.fileName)")
-                    } else {
-                        appLog("loadFullImage: Failed to load full image for index \(self.photoIndex), photo: \(photoToLoad.fileName)")
-                        // Keep fullImage nil
-                    }
-                     self.isLoadingFullImage = false
-                } else {
-                     appLog("loadFullImage: Load finished for index \(self.photoIndex), photo: \(photoToLoad.fileName), but view is now showing a different photo (\(self.photoIndex)). Discarding result.")
-                     // Don't update the UI if the index has changed since loading started
-                     // isLoadingFullImage might still need to be set to false if no other load is pending,
-                     // but it will be handled by the subsequent load triggered by onChange.
-                }
-            }
-        }
-    }
-
-    // Function to handle swipe gestures for navigation
-    private func handleSwipe(translation: CGSize) {
-        let swipeThreshold: CGFloat = 50
-
-        if translation.width < -swipeThreshold { // Swipe Left
-            if photoIndex < allPhotos.count - 1 {
-                 appLog("Swipe detected: Left. Old index: \(photoIndex)")
-                photoIndex += 1 // This triggers onChange
-                 appLog("Swipe processed: Left. New index: \(photoIndex)")
-            }
-        } else if translation.width > swipeThreshold { // Swipe Right
-            if photoIndex > 0 {
-                 appLog("Swipe detected: Right. Old index: \(photoIndex)")
-                photoIndex -= 1 // This triggers onChange
-                 appLog("Swipe processed: Right. New index: \(photoIndex)")
-            }
-        }
-    }
-
-    // Function to handle the Share action
-    private func sharePhoto() {
-        // Use computed currentPhoto
-        let photoToShare = currentPhoto
-        guard let imageToShare = fullImage else {
-            appLog("Share failed: Full image not available for \(photoToShare.fileName).")
-            // Maybe try loading it? Or show an error?
-            // For now, just return.
-            return
-        }
-
-        let activityViewController = UIActivityViewController(activityItems: [imageToShare], applicationActivities: nil)
-        guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-              let rootViewController = windowScene.windows.first?.rootViewController else {
-            appLog("Share failed: Could not find root view controller.")
-            return
-        }
-        rootViewController.present(activityViewController, animated: true, completion: nil)
-        appLog("Presenting share sheet for \(photoToShare.fileName)")
-    }
 }
-
-// MARK: - Swipe Gesture Extension (Already exists at the end of the file, removing the ZoomableScrollView from here)
-// extension View {
-//     func addSwipeGesture(onSwipeLeft: @escaping () -> Void, onSwipeRight: @escaping () -> Void) -> some View {
-//         self.gesture(
-//             DragGesture(minimumDistance: 20, coordinateSpace: .global)
-//                 .onEnded { value in
-//                     let horizontalAmount = value.translation.width
-//                     let verticalAmount = value.translation.height
-                    
-//                     if abs(horizontalAmount) > abs(verticalAmount) {
-//                         if horizontalAmount < 0 {
-//                             onSwipeLeft()
-//                         } else {
-//                             onSwipeRight()
-//                         }
-//                     }
-//                 }
-//         )
-//     }
-// }
 
 // MARK: - iOS 16 Conditional Modifiers
 extension View {

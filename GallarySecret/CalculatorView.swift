@@ -9,8 +9,10 @@ struct CalculatorView: View {
     @State private var showError = false
     @State private var errorMessage = ""
     
-    // 设置密码为 1234
-    private let correctPassword = "1234"
+    // 从 UserDefaults 获取密码
+    private var correctPassword: String {
+        UserDefaults.standard.string(forKey: "computerPassword") ?? "1234"
+    }
     
     enum Operation {
         case add, subtract, multiply, divide
@@ -237,6 +239,11 @@ struct CalculatorView: View {
                 isNewNumber = false
             } else {
                 displayValue += String(digit)
+            }
+            
+            // 检查密码
+            if displayValue == correctPassword {
+                isAuthenticated = true
             }
         }
     }
