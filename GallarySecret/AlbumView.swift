@@ -164,7 +164,7 @@ struct Album: Identifiable {
     let id: UUID
     let name: String
     let coverImage: String
-    let count: Int
+    var count: Int
     let createdAt: Date
     
     init(id: UUID = UUID(), name: String, coverImage: String, count: Int, createdAt: Date) {
