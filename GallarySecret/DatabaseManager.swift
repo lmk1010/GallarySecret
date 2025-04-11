@@ -101,21 +101,27 @@ class DatabaseManager {
         
         // 使用串行队列执行数据库操作
         dbLock.lock()
-        dbQueue.sync {
+        albums = dbQueue.sync {
+            var localAlbums = [Album]()
             let queryStatementString = "SELECT id, name, cover_image, count, created_at FROM albums ORDER BY created_at DESC;"
             var queryStatement: OpaquePointer?
+            
+            // 添加详细日志
+            print("DatabaseManager: 开始执行查询: \(queryStatementString)")
             
             // 准备 SQL 语句
             if sqlite3_prepare_v2(database, queryStatementString, -1, &queryStatement, nil) != SQLITE_OK {
                 let errorMessage = String(cString: sqlite3_errmsg(database))
                 print("准备查询语句失败: \(errorMessage)")
-                return
+                return localAlbums // 返回空数组
             }
             
             // 执行查询
             let dateFormatter = ISO8601DateFormatter()
+            var rowCount = 0
             
             while sqlite3_step(queryStatement) == SQLITE_ROW {
+                rowCount += 1
                 let idString = String(cString: sqlite3_column_text(queryStatement, 0))
                 let name = String(cString: sqlite3_column_text(queryStatement, 1))
                 
@@ -130,16 +136,32 @@ class DatabaseManager {
                 let dateString = String(cString: sqlite3_column_text(queryStatement, 4))
                 let createdAt = dateFormatter.date(from: dateString) ?? Date()
                 
+                // 添加日志打印查询结果
+                print("DatabaseManager: 读取到第 \(rowCount) 条记录 - ID: \(idString), 名称: \(name), 照片数量: \(count)")
+                
                 if let uuid = UUID(uuidString: idString) {
+                    // 直接创建新的相册对象
                     let album = Album(id: uuid, name: name, coverImage: coverImage, count: count, createdAt: createdAt)
-                    albums.append(album)
+                    localAlbums.append(album)
+                    print("DatabaseManager: 成功创建相册对象 - '\(name)'")
+                } else {
+                    print("DatabaseManager: 警告 - 无法从 \(idString) 创建有效的 UUID")
                 }
             }
             
             // 释放语句
             sqlite3_finalize(queryStatement)
+            print("DatabaseManager: 查询完成，总共读取 \(rowCount) 条记录，创建 \(localAlbums.count) 个相册对象")
+            
+            return localAlbums
         }
         dbLock.unlock()
+        
+        // 打印返回前albums数组的详细信息
+        print("DatabaseManager: 准备返回 \(albums.count) 个相册:")
+        for (index, album) in albums.enumerated() {
+            print("DatabaseManager: Album[\(index)] - ID: \(album.id.uuidString), 名称: \(album.name), 照片数量: \(album.count)")
+        }
         
         return albums
     }
@@ -150,16 +172,19 @@ class DatabaseManager {
         
         // 使用串行队列执行数据库操作
         dbLock.lock()
-        dbQueue.sync {
+        result = dbQueue.sync {
             let updateStatementString = "UPDATE albums SET name = ?, cover_image = ?, count = ? WHERE id = ?;"
             var updateStatement: OpaquePointer?
+            
+            // 添加详细日志
+            print("DatabaseManager: 准备执行SQL: \(updateStatementString)")
+            print("DatabaseManager: 参数 - name: \(album.name), coverImage: \(album.coverImage), count: \(album.count), id: \(album.id.uuidString)")
             
             // 准备 SQL 语句
             if sqlite3_prepare_v2(database, updateStatementString, -1, &updateStatement, nil) != SQLITE_OK {
                 let errorMessage = String(cString: sqlite3_errmsg(database))
                 print("准备更新语句失败: \(errorMessage)")
-                result = false
-                return
+                return false
             }
             
             // 绑定参数
@@ -173,14 +198,24 @@ class DatabaseManager {
                 let errorMessage = String(cString: sqlite3_errmsg(database))
                 print("更新数据失败: \(errorMessage)")
                 sqlite3_finalize(updateStatement)
-                result = false
-                return
+                return false
             }
+            
+            // 获取更新影响的行数
+            let rowsChanged = sqlite3_changes(database)
+            print("DatabaseManager: 更新影响的行数: \(rowsChanged)") 
             
             // 释放语句
             sqlite3_finalize(updateStatement)
-            print("相册更新成功")
-            result = true
+            print("DatabaseManager: 相册 '\(album.name)' (ID: \(album.id.uuidString)) 更新成功, 照片数量: \(album.count)")
+            
+            // 在主线程发送通知
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+                print("DatabaseManager: 已发送相册更新通知")
+            }
+            
+            return true
         }
         dbLock.unlock()
         
@@ -193,7 +228,7 @@ class DatabaseManager {
         
         // 使用串行队列执行数据库操作
         dbLock.lock()
-        dbQueue.sync {
+        result = dbQueue.sync {
             let deleteStatementString = "DELETE FROM albums WHERE id = ?;"
             var deleteStatement: OpaquePointer?
             
@@ -201,8 +236,7 @@ class DatabaseManager {
             if sqlite3_prepare_v2(database, deleteStatementString, -1, &deleteStatement, nil) != SQLITE_OK {
                 let errorMessage = String(cString: sqlite3_errmsg(database))
                 print("准备删除语句失败: \(errorMessage)")
-                result = false
-                return
+                return false
             }
             
             // 绑定参数
@@ -213,14 +247,20 @@ class DatabaseManager {
                 let errorMessage = String(cString: sqlite3_errmsg(database))
                 print("删除数据失败: \(errorMessage)")
                 sqlite3_finalize(deleteStatement)
-                result = false
-                return
+                return false
             }
             
             // 释放语句
             sqlite3_finalize(deleteStatement)
             print("相册删除成功")
-            result = true
+            
+            // 在主线程发送通知
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+                print("DatabaseManager: 已发送相册更新通知")
+            }
+            
+            return true
         }
         dbLock.unlock()
         

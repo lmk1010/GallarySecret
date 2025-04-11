@@ -41,6 +41,39 @@ struct AlbumsListView: View {
     @State private var isSelectionMode = false
     @State private var selectedAlbumIDs = Set<UUID>()
     @State private var showingMultiDeleteAlert = false
+    
+    // 添加一个强制刷新的方法
+    private func reloadAlbums() {
+        appLog("AlbumsListView: 开始重新加载相册列表")
+        // 在后台线程获取数据
+        DispatchQueue.global(qos: .userInitiated).async {
+            let dbAlbums = DatabaseManager.shared.getAllAlbums()
+            appLog("AlbumsListView: 从数据库获取到 \(dbAlbums.count) 个相册")
+            
+            // 打印每个相册的详细信息（数据库数据）
+            for (index, album) in dbAlbums.enumerated() {
+                appLog("AlbumsListView: 数据库数据[\(index)] - ID: \(album.id.uuidString), 名称: \(album.name), 照片数量: \(album.count)")
+            }
+            
+            // 在主线程更新 UI
+            DispatchQueue.main.async {
+                // 直接使用数据库返回的数组，不做任何转换
+                self.albums = dbAlbums
+                
+                // 打印赋值后的数据
+                appLog("AlbumsListView: UI更新后的相册数量: \(self.albums.count)")
+                for (index, album) in self.albums.enumerated() {
+                    appLog("AlbumsListView: UI数据[\(index)] - ID: \(album.id.uuidString), 名称: \(album.name), 照片数量: \(album.count)")
+                }
+                
+                // 添加详细日志
+                appLog("AlbumsListView: 强制刷新后加载了 \(self.albums.count) 个相册")
+                for album in self.albums {
+                    appLog("AlbumsListView: 刷新后 - 相册 '\(album.name)' 包含 \(album.count) 张照片")
+                }
+            }
+        }
+    }
 
     var body: some View {
         NavigationView {
@@ -108,19 +141,19 @@ struct AlbumsListView: View {
             .navigationBarItems(leading: leadingNavigationButton, trailing: trailingNavigationButtons) // 动态按钮
             .sheet(isPresented: $showingCreateSheet) {
                 CreateAlbumView(onAlbumCreated: { newAlbum in
-                    self.albums.insert(newAlbum, at: 0)
+                    reloadAlbums()
                 })
             }
             .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
             .onAppear {
                 // 每次进入页面时强制从数据库重新加载相册数据
                 appLog("AlbumsListView: onAppear 强制刷新相册列表")
-                self.albums = DatabaseManager.shared.getAllAlbums()
+                reloadAlbums()
             }
             .onReceive(NotificationCenter.default.publisher(for: .didUpdateAlbumList)) { _ in
-                 appLog("AlbumsListView: Received didUpdateAlbumList notification. Reloading albums.")
-                 // 收到通知后重新加载相册数据
-                 self.albums = DatabaseManager.shared.getAllAlbums()
+                appLog("AlbumsListView: Received didUpdateAlbumList notification. Reloading albums.")
+                // 收到通知后重新加载相册数据
+                reloadAlbums()
             }
             .alert(isPresented: $showingDeleteAlert) { // 单个删除确认 - 移除外部标题
                 Alert(
@@ -186,7 +219,11 @@ struct AlbumsListView: View {
                              toggleSelection(for: album)
                          }
                  } else {
-                     NavigationLink(destination: PhotoGridView(album: album)) {
+                     NavigationLink(destination: {
+                         // 在创建PhotoGridView前打印相册信息
+                         let _ = appLog("AlbumsListView: NavigationLink创建PhotoGridView - 相册'\(album.name)'包含\(album.count)张照片")
+                         return PhotoGridView(album: album)
+                     }()) {
                          AlbumCard(album: album)
                      }
                      .buttonStyle(PlainButtonStyle())
@@ -334,7 +371,7 @@ struct AlbumsListView: View {
     }
 }
 
-struct Album: Identifiable, Equatable { // Conform to Equatable for removeAll
+struct Album: Identifiable, Equatable {
     let id: UUID
     let name: String
     let coverImage: String
@@ -351,13 +388,22 @@ struct Album: Identifiable, Equatable { // Conform to Equatable for removeAll
     
     // Implement Equatable
     static func == (lhs: Album, rhs: Album) -> Bool {
-        lhs.id == rhs.id
+        return lhs.id == rhs.id &&
+               lhs.name == rhs.name &&
+               lhs.coverImage == rhs.coverImage &&
+               lhs.count == rhs.count &&
+               lhs.createdAt == rhs.createdAt
     }
 }
 
 struct AlbumCard: View {
     let album: Album
     @Environment(\.colorScheme) var colorScheme
+    
+    init(album: Album) {
+        self.album = album
+        appLog("AlbumCard: 创建相册卡片 '\(album.name)'，显示照片数量: \(album.count)")
+    }
     
     var body: some View {
         ZStack {

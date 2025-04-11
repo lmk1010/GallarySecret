@@ -393,6 +393,7 @@ struct PhotoGridView: View {
     init(album: Album) {
         self.album = album
         _updatedAlbum = State(initialValue: album)
+        appLog("PhotoGridView: 初始化 - 相册'\(album.name)'包含\(album.count)张照片")
     }
     
     var body: some View {
@@ -719,7 +720,11 @@ struct PhotoGridView: View {
     
     // 加载相册中的照片
     private func loadPhotos() {
+        appLog("PhotoGridView: 开始加载相册 '\(album.name)' 的照片")
         photos = PhotoManager.shared.getPhotos(fromAlbum: album.id)
+        
+        // 添加日志，记录从PhotoManager获取的实际照片数量
+        appLog("PhotoGridView: loadPhotos - 获取到相册'\(album.name)'的照片数量: \(photos.count)，数据库中记录的数量: \(album.count)")
         
         // Trigger thumbnail preloading after photos are loaded
         if !photos.isEmpty {
@@ -735,8 +740,19 @@ struct PhotoGridView: View {
             createdAt: album.createdAt
         )
         
+        appLog("PhotoGridView: loadPhotos - 准备更新相册'\(album.name)'的照片数量从 \(album.count) 到 \(photos.count)")
+        
         if DatabaseManager.shared.updateAlbum(newAlbum) {
             updatedAlbum = newAlbum
+            appLog("PhotoGridView: loadPhotos - 数据库更新成功，更新后的相册'\(updatedAlbum.name)'照片数量: \(updatedAlbum.count)")
+            
+            // 确保通知发送后，等待一小段时间再继续
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+                appLog("PhotoGridView: loadPhotos - 已发送相册更新通知")
+            }
+        } else {
+            appLog("PhotoGridView: loadPhotos - 数据库更新失败")
         }
     }
     

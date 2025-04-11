@@ -283,40 +283,40 @@ class PhotoManager {
 
     // 更新相册照片数量 (直接修改数据库)
     private func updateAlbumPhotoCount(albumId: UUID, change: Int) {
-         appLog("PhotoManager: updateAlbumPhotoCount for album \(albumId) by \(change)")
-        // 移除后台调度，数据库操作本身可能很快，或者 DatabaseManager 内部处理线程
-        // DispatchQueue.global(qos: .utility).async { 
+        appLog("PhotoManager: updateAlbumPhotoCount for album \(albumId) by \(change)")
         
         // 1. 获取所有相册
         let allAlbums = DatabaseManager.shared.getAllAlbums()
+        appLog("PhotoManager: 读取到 \(allAlbums.count) 个相册，准备更新相册 \(albumId) 的照片数量")
         
         // 2. 查找需要更新的相册
-        if var albumToUpdate = allAlbums.first(where: { $0.id == albumId }) {
-            appLog("PhotoManager: Found album '\(albumToUpdate.name)' in DB to update count.")
+        if let index = allAlbums.firstIndex(where: { $0.id == albumId }) {
+            var albumToUpdate = allAlbums[index]
+            appLog("PhotoManager: 找到相册 '\(albumToUpdate.name)'，当前照片数量为 \(albumToUpdate.count)")
+            
             // 3. 计算新数量并更新相册对象
             let newCount = max(0, albumToUpdate.count + change) // 确保不为负
             albumToUpdate.count = newCount
             
             // 4. 将更新后的相册写回数据库
-            appLog("PhotoManager: Attempting to update album count in DB for \(albumId) to \(newCount)")
+            appLog("PhotoManager: 正在更新相册 '\(albumToUpdate.name)' 的照片数量，从 \(albumToUpdate.count - change) 变为 \(newCount)")
             let updateSuccess = DatabaseManager.shared.updateAlbum(albumToUpdate)
-            appLog("PhotoManager: DB update result for \(albumId): \(updateSuccess)")
+            appLog("PhotoManager: 数据库更新结果: \(updateSuccess ? "成功" : "失败")")
 
             if updateSuccess {
-                appLog("PhotoManager: Successfully updated album count in DB to \(newCount) for \(albumId)")
+                appLog("PhotoManager: 成功更新相册 '\(albumToUpdate.name)' 的照片数量为 \(newCount)")
                 // 5. 在主线程发送通知，告知UI需要刷新
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
-                    appLog("PhotoManager: Posted didUpdateAlbumList notification.")
+                    appLog("PhotoManager: 已发送 didUpdateAlbumList 通知")
                 }
             } else {
-                appLog("PhotoManager: Failed to update album count in DB for \(albumId)")
+                appLog("PhotoManager: 更新相册 '\(albumToUpdate.name)' 的照片数量失败")
             }
         } else {
             // 如果没有找到相册，记录日志
-            appLog("PhotoManager: updateAlbumPhotoCount - Could not find album with id \(albumId) in DB to update count.")
+            appLog("PhotoManager: 未找到相册 \(albumId)，无法更新照片数量")
         }
-        // }
     }
 
 
