@@ -374,6 +374,10 @@ struct PhotoGridView: View {
     @State private var selectedPhoto: Photo? = nil
     @State private var preloadedThumbnails = false
     
+    // 照片库权限状态
+    @State private var photoLibraryAuthorizationStatus: PHAuthorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+    @State private var showPermissionAlert = false
+    
     // 新增 State 用于删除确认
     @State private var showDeleteFromLibraryAlert = false
     @State private var successfullyImportedIdentifiers: [String] = []
@@ -501,7 +505,7 @@ struct PhotoGridView: View {
                     .disabled(!canAddMorePhotos)
                     .onChange(of: selectedItems) { newItems in
                         if canAddMorePhotos {
-                            importPhotos(from: newItems)
+                            checkPhotoLibraryPermissionAndImport(newItems)
                         } else {
                             showMembershipAlert = true
                             selectedItems.removeAll()
@@ -549,6 +553,15 @@ struct PhotoGridView: View {
         .onAppear {
             appLog("PhotoGridView onAppear - Start loading photos")
             loadPhotos()
+            checkInitialPhotoLibraryPermission()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            // 当应用从后台返回前台时，检查权限状态是否有变化
+            let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            if currentStatus != photoLibraryAuthorizationStatus {
+                appLog("PhotoGridView: 检测到照片库权限状态变化: \(photoLibraryAuthorizationStatus) -> \(currentStatus)")
+                photoLibraryAuthorizationStatus = currentStatus
+            }
         }
         .alert("Delete Imported Photos?", isPresented: $showDeleteFromLibraryAlert) {
             Button("Delete", role: .destructive) {
@@ -597,6 +610,19 @@ struct PhotoGridView: View {
             }
         } message: {
             Text("This photo album has reached the limit of 100 photos. Upgrade to premium for unlimited photo storage.")
+        }
+        .alert("Photo Access Required", isPresented: $showPermissionAlert) {
+            Button("Go to Settings") {
+                if let settingsUrl = URL(string: UIApplication.openSettingsURLString) {
+                    UIApplication.shared.open(settingsUrl)
+                }
+                showPermissionAlert = false
+            }
+            Button("Cancel", role: .cancel) {
+                showPermissionAlert = false
+            }
+        } message: {
+            Text("This app needs access to your photo library to import photos. Please enable photo access in Settings.")
         }
     }
     
@@ -816,6 +842,53 @@ struct PhotoGridView: View {
     }
     
     // 导入照片
+    // 检查照片库权限并导入照片
+    private func checkPhotoLibraryPermissionAndImport(_ items: [PhotosPickerItem]) {
+        guard !items.isEmpty else { return }
+        
+        let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        photoLibraryAuthorizationStatus = currentStatus
+        
+        switch currentStatus {
+        case .authorized:
+            appLog("PhotoGridView: 照片库权限已授权，开始导入照片")
+            importPhotos(from: items)
+        case .denied, .restricted:
+            appLog("PhotoGridView: 照片库权限被拒绝或受限")
+            showPermissionAlert = true
+            selectedItems.removeAll() // 清空选择
+        case .notDetermined:
+            appLog("PhotoGridView: 照片库权限未确定，请求权限")
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { [self] status in
+                DispatchQueue.main.async {
+                    self.photoLibraryAuthorizationStatus = status
+                    if status == .authorized {
+                        appLog("PhotoGridView: 用户授权照片库访问，开始导入照片")
+                        self.importPhotos(from: items)
+                    } else {
+                        appLog("PhotoGridView: 用户拒绝照片库访问")
+                        self.showPermissionAlert = true
+                        self.selectedItems.removeAll()
+                    }
+                }
+            }
+        case .limited:
+            appLog("PhotoGridView: 照片库权限受限，但可以访问选定的照片")
+            importPhotos(from: items)
+        @unknown default:
+            appLog("PhotoGridView: 未知的照片库权限状态")
+            showPermissionAlert = true
+            selectedItems.removeAll()
+        }
+    }
+    
+    // 检查初始照片库权限状态
+    private func checkInitialPhotoLibraryPermission() {
+        let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        photoLibraryAuthorizationStatus = currentStatus
+        appLog("PhotoGridView: 初始照片库权限状态: \(currentStatus.rawValue)")
+    }
+    
     private func importPhotos(from items: [PhotosPickerItem]) {
         guard !items.isEmpty else { return }
         
@@ -932,6 +1005,9 @@ struct PhotoGridView: View {
             // 6. 更新 UI (切换回主线程)
             await MainActor.run {
                 self.isLoading = false
+                
+                // 清空选择项，确保PhotosPicker能够重新选择
+                self.selectedItems.removeAll()
 
                 if !successfullySavedPhotos.isEmpty {
                     appLog("Import successful. Notification should trigger AlbumsListView refresh.") // Update log message
