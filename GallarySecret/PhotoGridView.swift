@@ -387,6 +387,10 @@ struct PhotoGridView: View {
     @State private var showSingleDeleteAlert = false
     @State private var showAlbumSelectionSheet = false // <-- ADD State for sheet
     
+    // 会员限制相关状态
+    @ObservedObject private var storeManager = StoreKitManager.shared
+    @State private var showMembershipAlert = false
+    
     // Create the thumbnail cache manager
     @StateObject private var thumbnailCacheManager = ThumbnailCacheManager()
     
@@ -394,6 +398,25 @@ struct PhotoGridView: View {
         self.album = album
         _updatedAlbum = State(initialValue: album)
         appLog("PhotoGridView: 初始化 - 相册'\(album.name)'包含\(album.count)张照片")
+    }
+    
+    // 检查是否可以添加更多照片
+    private var canAddMorePhotos: Bool {
+        if storeManager.isMember {
+            return true // 会员无限制
+        } else {
+            // 非会员在任何相册中都可以添加到100张，不受相册数量限制
+            return photos.count < 100
+        }
+    }
+    
+    // 获取当前照片数量限制提示
+    private var photoLimitMessage: String {
+        if storeManager.isMember {
+                    return "Unlimited for premium users"
+    } else {
+        return "\(photos.count)/100 (Free users limited to 100 photos per album)"
+    }
     }
     
     var body: some View {
@@ -414,9 +437,9 @@ struct PhotoGridView: View {
             // Leading Item (Cancel button in selection mode)
             ToolbarItem(placement: .navigationBarLeading) {
                 if isSelectionMode {
-                    Button("取消") {
-                        exitSelectionMode()
-                    }
+                                    Button("Cancel") {
+                    exitSelectionMode()
+                }
                 }
                 // No else needed, shows nothing when not in selection mode
             }
@@ -442,14 +465,14 @@ struct PhotoGridView: View {
                         Button {
                             shareSelectedPhotosExternally()
                         } label: {
-                            Label("分享到...", systemImage: "square.and.arrow.up")
+                            Label("Share to...", systemImage: "square.and.arrow.up")
                         }
                         .disabled(selectedPhotoIDs.isEmpty)
 
                         Button {
                             showAlbumSelectionSheet = true
                         } label: {
-                            Label("移动到相册...", systemImage: "folder")
+                            Label("Move to Album...", systemImage: "folder")
                         }
                         .disabled(selectedPhotoIDs.isEmpty)
 
@@ -462,7 +485,7 @@ struct PhotoGridView: View {
                 // Place Select and Import buttons in separate ToolbarItems
                 // Place "Select" button first (appears further right)
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("选择") {
+                    Button("Select") {
                         enterSelectionMode()
                     }
                 }
@@ -475,8 +498,14 @@ struct PhotoGridView: View {
                     ) {
                         Image(systemName: "plus")
                     }
+                    .disabled(!canAddMorePhotos)
                     .onChange(of: selectedItems) { newItems in
-                        importPhotos(from: newItems)
+                        if canAddMorePhotos {
+                            importPhotos(from: newItems)
+                        } else {
+                            showMembershipAlert = true
+                            selectedItems.removeAll()
+                        }
                     }
                 }
             }
@@ -490,7 +519,7 @@ struct PhotoGridView: View {
             }
         }
         .fullScreenCover(item: $selectedPhoto, onDismiss: {
-            appLog("照片详情视图已关闭 (item dismissed)")
+            appLog("Photo detail view closed (item dismissed)")
         }) { photo in
             if let index = photos.firstIndex(where: { $0.id == photo.id }) {
                 let _ = appLog("fullScreenCover(item:): Creating ImageDetailView for \\(photo.fileName) at index \\(index)")
@@ -518,45 +547,56 @@ struct PhotoGridView: View {
             }
         }
         .onAppear {
-            appLog("PhotoGridView onAppear - 开始加载照片")
+            appLog("PhotoGridView onAppear - Start loading photos")
             loadPhotos()
         }
-        .alert("删除已导入的照片?", isPresented: $showDeleteFromLibraryAlert) {
-            Button("删除", role: .destructive) {
+        .alert("Delete Imported Photos?", isPresented: $showDeleteFromLibraryAlert) {
+            Button("Delete", role: .destructive) {
                 deleteImportedPhotosFromLibrary()
             }
-            Button("保留", role: .cancel) {
+            Button("Keep", role: .cancel) {
                 successfullyImportedIdentifiers = []
                 appLog("User chose not to delete photos from library.")
             }
         } message: {
-            Text("您想从系统\"照片\"应用中删除刚刚导入的 \(successfullyImportedIdentifiers.count) 张照片吗？此操作不可撤销。")
+            Text("Do you want to delete the \(successfullyImportedIdentifiers.count) photos you just imported from the system \"Photos\" app? This action cannot be undone.")
         }
-        .alert("照片库操作结果", isPresented: $showResultAlert, actions: {
-            Button("好的") {
+        .alert("Photo Library Operation Result", isPresented: $showResultAlert, actions: {
+            Button("OK") {
                 deleteAlertMessage = ""
                 showResultAlert = false
             }
         }, message: {
             Text(deleteAlertMessage)
         })
-        .alert("删除所选照片?", isPresented: $showMultiDeleteAlert) {
-            Button("删除", role: .destructive) {
+        .alert("Delete Selected Photos?", isPresented: $showMultiDeleteAlert) {
+            Button("Delete", role: .destructive) {
                 deleteSelectedPhotos()
             }
-            Button("取消", role: .cancel) {}
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("确定要删除选中的 \(selectedPhotoIDs.count) 张照片吗？此操作将从应用内部删除这些照片，但不会影响系统相册。")
+            Text("Are you sure you want to delete the selected \(selectedPhotoIDs.count) photos? This will delete these photos from within the app but will not affect the system album.")
         }
-        .alert("删除照片", isPresented: $showSingleDeleteAlert) {
-            Button("删除", role: .destructive) {
+        .alert("Delete Photo", isPresented: $showSingleDeleteAlert) {
+            Button("Delete", role: .destructive) {
                 executeDeleteSinglePhoto()
             }
-            Button("取消", role: .cancel) {
-                photoToDeleteSingle = nil // 清理
+            Button("Cancel", role: .cancel) {
+                photoToDeleteSingle = nil // Clean up
             }
         } message: {
-            Text("确定要删除这张照片吗？此操作将从应用内部删除照片，但不会影响系统相册。")
+            Text("Are you sure you want to delete this photo? This will delete the photo from within the app but will not affect the system album.")
+        }
+        .alert("Photo Album Capacity Full", isPresented: $showMembershipAlert) {
+            Button("Upgrade to Premium") {
+                // Navigate to membership purchase page
+                showMembershipAlert = false
+            }
+            Button("Cancel", role: .cancel) {
+                showMembershipAlert = false
+            }
+        } message: {
+            Text("This photo album has reached the limit of 100 photos. Upgrade to premium for unlimited photo storage.")
         }
     }
     
@@ -580,15 +620,21 @@ struct PhotoGridView: View {
                 .font(.system(size: 60))
                 .foregroundColor(colorScheme == .dark ? .gray : .gray.opacity(0.7))
             
-            Text("暂无图片")
+            Text("No Photos")
                 .font(.title2)
                 .fontWeight(.medium)
                 .foregroundColor(colorScheme == .dark ? .white : .black)
             
-            Text("点击右上角的"+"按钮导入照片")
+            Text("Click the '+' button in the top right corner to import photos")
                 .font(.subheadline)
                 .foregroundColor(.gray)
                 .multilineTextAlignment(.center)
+                .padding(.horizontal)
+            
+            // 添加照片数量限制信息
+            Text(photoLimitMessage)
+                .font(.caption)
+                .foregroundColor(.gray)
                 .padding(.horizontal)
             
             Spacer()
@@ -598,13 +644,25 @@ struct PhotoGridView: View {
     
     // 照片网格视图
     private var photoGridView: some View {
-        ScrollView {
-            LazyVGrid(columns: gridLayout, spacing: 6) {
-                ForEach(photos) { photo in
-                    gridItemView(for: photo)
-                }
+        VStack {
+            // 添加照片数量限制信息
+            HStack {
+                Text(photoLimitMessage)
+                    .font(.caption)
+                    .foregroundColor(.gray)
+                Spacer()
             }
-            .padding(8)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            
+            ScrollView {
+                LazyVGrid(columns: gridLayout, spacing: 6) {
+                    ForEach(photos) { photo in
+                        gridItemView(for: photo)
+                    }
+                }
+                .padding(8)
+            }
         }
     }
     
@@ -614,7 +672,7 @@ struct PhotoGridView: View {
             if isSelectionMode {
                 toggleSelection(for: photo)
             } else {
-                appLog("用户点击缩略图: \(photo.fileName)")
+                appLog("User clicked thumbnail: \(photo.fileName)")
                 selectedPhoto = photo
                 appLog("Button Action: Set selectedPhoto to \(photo.fileName) to trigger cover")
             }
@@ -670,13 +728,13 @@ struct PhotoGridView: View {
         }
     }
     
-    // 顶部按钮
+    // Top buttons
     private var trailingButtons: some View {
         HStack {
             if isSelectionMode {
                 EmptyView()
             } else {
-                Button("选择") {
+                Button("Select") {
                     enterSelectionMode()
                 }
 
@@ -694,7 +752,7 @@ struct PhotoGridView: View {
         }
     }
     
-    // 加载指示器视图
+    // Loading indicator view
     private var loadingView: some View {
         Group {
             if isLoading {
@@ -707,7 +765,7 @@ struct PhotoGridView: View {
                             .scaleEffect(1.5)
                             .padding()
                         
-                        Text("正在导入照片...")
+                        Text("Importing photos...")
                             .font(.headline)
                             .foregroundColor(.white)
                     }
@@ -718,7 +776,7 @@ struct PhotoGridView: View {
         }
     }
     
-    // 加载相册中的照片
+    // Load photos from album
     private func loadPhotos() {
         appLog("PhotoGridView: 开始加载相册 '\(album.name)' 的照片")
         photos = PhotoManager.shared.getPhotos(fromAlbum: album.id)
@@ -746,11 +804,12 @@ struct PhotoGridView: View {
             updatedAlbum = newAlbum
             appLog("PhotoGridView: loadPhotos - 数据库更新成功，更新后的相册'\(updatedAlbum.name)'照片数量: \(updatedAlbum.count)")
             
-            // 确保通知发送后，等待一小段时间再继续
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
-                appLog("PhotoGridView: loadPhotos - 已发送相册更新通知")
-            }
+            // 修复：不要在loadPhotos中发送通知，避免与照片导入过程产生冲突
+            // 通知应该只在必要时发送，比如创建、删除相册时
+            // DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            //     NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+            //     appLog("PhotoGridView: loadPhotos - 已发送相册更新通知")
+            // }
         } else {
             appLog("PhotoGridView: loadPhotos - 数据库更新失败")
         }
@@ -760,6 +819,33 @@ struct PhotoGridView: View {
     private func importPhotos(from items: [PhotosPickerItem]) {
         guard !items.isEmpty else { return }
         
+        // 检查会员限制
+        if !canAddMorePhotos {
+            showMembershipAlert = true
+            return
+        }
+        
+        // 检查是否会超过限制
+        let remainingSlots = storeManager.isMember ? Int.max : (100 - photos.count)
+        let itemsToImport = min(items.count, remainingSlots)
+        
+        if itemsToImport < items.count {
+            // 如果选择的照片数量超过限制，只导入允许的数量
+            let limitedItems = Array(items.prefix(itemsToImport))
+            importPhotosInternal(from: limitedItems)
+            
+            // 显示限制提示
+            DispatchQueue.main.async {
+                                            self.deleteAlertMessage = "Due to photo album capacity limitations, only the first \(itemsToImport) photos were imported. This album can add \(100 - self.photos.count) more photos. Upgrade to premium for unlimited photo imports."
+                self.showResultAlert = true
+            }
+        } else {
+            importPhotosInternal(from: items)
+        }
+    }
+    
+    // 内部导入照片函数
+    private func importPhotosInternal(from items: [PhotosPickerItem]) {
         isLoading = true
         var successfullyImportedIdentifiers: [String] = [] // 本次成功导入的系统标识符
         var successfullySavedPhotos: [Photo] = [] // 本次成功保存的 Photo 对象
@@ -853,17 +939,20 @@ struct PhotoGridView: View {
                     // NOTE: Removed the redundant self.loadPhotos() call here.
                     // AlbumsListView's .onReceive will handle the refresh.
                     
-                    // 添加loadPhotos()调用，确保导入后刷新照片列表
+                    // 修复：确保照片导入后立即刷新照片列表，避免状态不一致
                     self.loadPhotos()
                     appLog("Called loadPhotos() to refresh the photo grid after import")
 
-                    // Prepare to show the delete prompt
-                    self.successfullyImportedIdentifiers = successfullyImportedIdentifiers
-                    self.showDeleteFromLibraryAlert = true // Show delete prompt
-                    appLog("Will prompt to delete \\(successfullyImportedIdentifiers.count) photos from library.")
+                    // 延迟显示删除提示，确保UI更新完成
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        // Prepare to show the delete prompt
+                        self.successfullyImportedIdentifiers = successfullyImportedIdentifiers
+                        self.showDeleteFromLibraryAlert = true // Show delete prompt
+                        appLog("Will prompt to delete \(successfullyImportedIdentifiers.count) photos from library.")
+                    }
                 } else {
                     appLog("没有照片成功保存，显示导入失败提示。")
-                    self.deleteAlertMessage = "照片导入失败。尝试了 \\(items.count) 张，成功 0 张。详情请查看日志。"
+                    self.deleteAlertMessage = "照片导入失败。尝试了 \(items.count) 张，成功 0 张。详情请查看日志。"
                     if !failedIdentifiers.isEmpty {
                         // 只取第一个失败原因作为示例给用户看
                         if let firstError = failedIdentifiers.first?.value {
@@ -925,7 +1014,7 @@ struct PhotoGridView: View {
     // 根据是否在选择模式决定导航栏标题
     private var navigationTitle: String {
         if isSelectionMode {
-            return "已选择 \(selectedPhotoIDs.count) 项"
+            return "Selected \(selectedPhotoIDs.count) items"
         } else {
             return updatedAlbum.name
         }
@@ -1269,14 +1358,14 @@ struct ImageDetailView: View {
         .sheet(isPresented: $showPhotoInfo) {
             photoInfoView
         }
-        .alert("删除照片", isPresented: $showDeleteAlert) {
-            Button("删除", role: .destructive) {
+        .alert("Delete Photo", isPresented: $showDeleteAlert) {
+            Button("Delete", role: .destructive) {
                 onDelete(currentPhoto)
                 presentationMode.wrappedValue.dismiss()
             }
-            Button("取消", role: .cancel) {}
+            Button("Cancel", role: .cancel) {}
         } message: {
-            Text("确定要删除这张照片吗？此操作将从应用内部删除照片，但不会影响系统相册。")
+            Text("Are you sure you want to delete this photo? This will delete the photo from within the app but will not affect the system album.")
         }
     }
 
@@ -1329,7 +1418,7 @@ struct ImageDetailView: View {
                         .scaledToFit()
                         .frame(width: 100, height: 100)
                         .foregroundColor(.gray)
-                    Text("无法加载图片")
+                    Text("Unable to load image")
                         .foregroundColor(.white)
                 }
             }
@@ -1400,7 +1489,7 @@ struct ImageDetailView: View {
     // MARK: - Methods
     private func loadPhotoMetadata() {
         Task {
-            // 获取照片拍摄时间
+            // Get photo capture time
             let date = PhotoManager.shared.getPhotoDateTaken(for: currentPhoto)
             await MainActor.run {
                 self.dateTaken = date
@@ -1448,7 +1537,7 @@ struct ImageDetailView: View {
     }
 
     private func preloadAdjacentImages() {
-        // 预加载下一张图片
+        // Preload next image
         if photoIndex < allPhotos.count - 1 {
             let nextPhoto = allPhotos[photoIndex + 1]
             Task.detached(priority: .userInitiated) {
@@ -1461,7 +1550,7 @@ struct ImageDetailView: View {
             nextImage = nil
         }
         
-        // 预加载上一张图片
+        // Preload previous image
         if photoIndex > 0 {
             let prevPhoto = allPhotos[photoIndex - 1]
             Task.detached(priority: .userInitiated) {
@@ -1480,19 +1569,19 @@ struct ImageDetailView: View {
         
         let activityViewController = UIActivityViewController(activityItems: [image], applicationActivities: nil)
         
-        // 找到当前窗口场景
+        // Find current window scene
         guard let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
               let rootViewController = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
             return
         }
         
-        // 找到最顶层的视图控制器
+        // Find the topmost view controller
         var topController = rootViewController
         while let presentedViewController = topController.presentedViewController {
             topController = presentedViewController
         }
         
-        // 为 iPad 兼容性设置
+        // Setup for iPad compatibility
         if let popoverController = activityViewController.popoverPresentationController {
             popoverController.sourceView = topController.view
             popoverController.sourceRect = CGRect(x: topController.view.bounds.midX, y: topController.view.bounds.midY, width: 0, height: 0)
@@ -1505,30 +1594,30 @@ struct ImageDetailView: View {
     private var photoInfoView: some View {
         NavigationView {
             List {
-                Section(header: Text("照片信息")) {
+                Section(header: Text("Photo Information")) {
                     HStack {
-                        Text("文件名")
+                        Text("File Name")
                         Spacer()
                         Text(currentPhoto.fileName)
                             .foregroundColor(.gray)
                     }
                     
                     HStack {
-                        Text("拍摄时间")
+                        Text("Capture Time")
                         Spacer()
                         Text(dateTaken ?? currentPhoto.createdAt, formatter: dateFormatter)
                             .foregroundColor(.gray)
                     }
                     
                     HStack {
-                        Text("尺寸")
+                        Text("Dimensions")
                         Spacer()
                         Text(PhotoManager.shared.getPhotoSizeString(for: currentPhoto))
                             .foregroundColor(.gray)
                     }
                     
                     HStack {
-                        Text("文件大小")
+                        Text("File Size")
                         Spacer()
                         Text(PhotoManager.shared.getPhotoFileSize(for: currentPhoto))
                             .foregroundColor(.gray)
@@ -1536,8 +1625,8 @@ struct ImageDetailView: View {
                 }
             }
             .listStyle(InsetGroupedListStyle())
-            .navigationBarTitle("照片详情", displayMode: .inline)
-            .navigationBarItems(trailing: Button("完成") {
+            .navigationBarTitle("Photo Details", displayMode: .inline)
+            .navigationBarItems(trailing: Button("Done") {
                 showPhotoInfo = false
             })
         }

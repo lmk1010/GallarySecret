@@ -101,7 +101,7 @@ struct CalculatorView: View {
                 VStack(spacing: 12) {
                     Spacer()
                     
-                    // 显示区域
+                    // Display area
                     HStack {
                         Spacer()
                         Text(displayValue)
@@ -110,13 +110,13 @@ struct CalculatorView: View {
                             .padding()
                     }
                     
-                    // 提示文本
-                    // Text("请输入密码")
+                    // Hint text
+                    // Text("Please enter password")
                     //     .foregroundColor(.white)
                     //     .font(.headline)
                     //     .padding(.bottom, 20)
                     
-                    // 按钮网格
+                    // Button grid
                     ForEach(0..<buttons.count, id: \.self) { rowIndex in
                         HStack(spacing: 12) {
                             ForEach(buttons[rowIndex]) { button in
@@ -128,8 +128,8 @@ struct CalculatorView: View {
                     }
                 }
                 .padding(.bottom)
-                .alert("错误", isPresented: $showError) {
-                    Button("确定", role: .cancel) {
+                .alert("Error", isPresented: $showError) {
+                    Button("OK", role: .cancel) {
                         displayValue = "0"
                         currentOperation = nil
                         previousValue = 0
@@ -204,7 +204,7 @@ struct CalculatorView: View {
                     result = previousValue / currentValue
                 }
                 
-                // 格式化结果，如果是整数则不显示小数点
+                // Format result, show integer if possible
                 if result.truncatingRemainder(dividingBy: 1) == 0 {
                     displayValue = String(Int(result))
                 } else {
@@ -214,15 +214,15 @@ struct CalculatorView: View {
                 currentOperation = nil
                 isNewNumber = true
                 
-                // 验证密码
+                // Verify password
                 if displayValue == correctPassword {
                     isAuthenticated = true
                 } else {
                     showError = true
-                    errorMessage = "密码错误，请重试"
+                    errorMessage = "Incorrect password, please try again"
                 }
             } else {
-                // 直接验证当前显示的值
+                // Directly verify current displayed value
                 if displayValue == correctPassword {
                     isAuthenticated = true
                 }
@@ -241,7 +241,7 @@ struct CalculatorView: View {
                 displayValue += String(digit)
             }
             
-            // 检查密码
+            // Check password
             if displayValue == correctPassword {
                 isAuthenticated = true
             }

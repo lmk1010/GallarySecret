@@ -8,6 +8,7 @@ import CoreGraphics
 extension Notification.Name {
     static let didUpdateAlbumList = Notification.Name("didUpdateAlbumListNotification")
     static let willReturnToAlbumList = Notification.Name("willReturnToAlbumListNotification")
+    static let membershipStatusDidChange = Notification.Name("membershipStatusDidChange")
 }
 
 // 照片模型
@@ -50,6 +51,21 @@ class PhotoManager {
         // 配置图片缓存
         imageCache.countLimit = 200 // 可以适当增加缓存数量
         imageCache.totalCostLimit = 1024 * 1024 * 100 // 限制缓存大小为 100MB (粗略估计)
+    }
+    
+    // 保存图片到系统相册
+    func saveImageToPhotos(_ image: UIImage) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            PHPhotoLibrary.shared().performChanges({
+                PHAssetChangeRequest.creationRequestForAsset(from: image)
+            }) { success, error in
+                if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(throwing: error ?? NSError(domain: "PhotoManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to save to system album"]))
+                }
+            }
+        }
     }
 
     // 创建相册目录
@@ -308,7 +324,11 @@ class PhotoManager {
                 // 5. 在主线程发送通知，告知UI需要刷新
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
-                    appLog("PhotoManager: 已发送 didUpdateAlbumList 通知")
+                    if change < 0 {
+                        appLog("PhotoManager: 已发送 didUpdateAlbumList 通知 (照片删除)")
+                    } else {
+                        appLog("PhotoManager: 已发送 didUpdateAlbumList 通知 (照片添加)")
+                    }
                 }
             } else {
                 appLog("PhotoManager: 更新相册 '\(albumToUpdate.name)' 的照片数量失败")
@@ -521,7 +541,7 @@ class PhotoManager {
         guard let metadata = getPhotoMetadata(for: photo),
               let width = metadata["PixelWidth"] as? Int,
               let height = metadata["PixelHeight"] as? Int else {
-            return "未知尺寸"
+            return "Unknown size"
         }
         
         return "\(width) × \(height)"
@@ -530,7 +550,7 @@ class PhotoManager {
     // 获取照片文件大小
     func getPhotoFileSize(for photo: Photo) -> String {
         guard let imagePath = photo.imagePath else {
-            return "未知大小"
+            return "Unknown size"
         }
         
         do {
@@ -546,7 +566,7 @@ class PhotoManager {
             appLog("PhotoManager: getPhotoFileSize - Failed to get file size for \(photo.fileName): \(error)")
         }
         
-        return "未知大小"
+                    return "Unknown size"
     }
 
     // --- 与系统相册交互 (占位符，需要实现) ---
@@ -557,7 +577,7 @@ class PhotoManager {
         PHPhotoLibrary.requestAuthorization(for: requiredAccessLevel) { status in
             guard status == .authorized else {
                 appLog("PhotoManager: deletePhotosFromLibrary - Photo Library access denied or limited.")
-                completion(false, NSError(domain: "PhotoManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "照片库访问权限不足"]))
+                completion(false, NSError(domain: "PhotoManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Insufficient photo library access permissions"]))
                 return
             }
 

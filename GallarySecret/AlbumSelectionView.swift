@@ -35,7 +35,7 @@ struct AlbumSelectionView: View {
                             VStack(alignment: .leading) {
                                 Text(album.name)
                                     .font(.headline)
-                                Text("\\(album.count) 张照片") // Use album.count directly
+                                Text("\(album.count) photos") // Use album.count directly
                                     .font(.subheadline)
                                     .foregroundColor(.gray)
                             }
@@ -48,11 +48,11 @@ struct AlbumSelectionView: View {
                     .foregroundColor(.primary) // Ensure text color is standard
                 }
             }
-            .navigationTitle("选择目标相册")
+            .navigationTitle("Select Destination Album")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button("取消") {
+                    Button("Cancel") {
                         presentationMode.wrappedValue.dismiss()
                     }
                 }
@@ -67,7 +67,7 @@ struct AlbumSelectionView: View {
         self.albums = DatabaseManager.shared.getAllAlbums()
         // Optional: Sort albums, e.g., by name or creation date
         // self.albums.sort { $0.name < $1.name }
-        appLog("AlbumSelectionView: Loaded \\(albums.count) albums.")
+        appLog("AlbumSelectionView: Loaded \(albums.count) albums.")
     }
 }
 
@@ -83,7 +83,7 @@ struct AlbumSelectionView: View {
 //             selectedPhotoIDs: [dummyUUID1],
 //             currentAlbumId: dummyUUID2,
 //             onAlbumSelected: { selectedId in
-//                 print("Preview: Selected album ID \\(selectedId)")
+//                 print("Preview: Selected album ID \(selectedId)")
 //             }
 //         )
 //     }

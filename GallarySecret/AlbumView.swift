@@ -8,14 +8,14 @@ struct MainView: View {
             AlbumsListView()
                 .tabItem {
                     Image(systemName: "photo.on.rectangle.angled")
-                    Text("相册")
+                    Text("Albums")
                 }
                 .tag(0)
             
             ProfileView()
                 .tabItem {
                     Image(systemName: "person.circle")
-                    Text("我的")
+                    Text("Profile")
                 }
                 .tag(1)
         }
@@ -36,40 +36,50 @@ struct AlbumsListView: View {
     @State private var showingDeleteAlert = false
     @State private var albumToDelete: Album?
     @Environment(\.colorScheme) var colorScheme
+    @ObservedObject private var storeManager = StoreKitManager.shared
     
     // 新增状态变量用于选择模式
     @State private var isSelectionMode = false
     @State private var selectedAlbumIDs = Set<UUID>()
     @State private var showingMultiDeleteAlert = false
     
+    // 移出相册相关状态
+    @State private var showingExportSheet = false
+    @State private var albumToExport: Album?
+    @State private var showingExportAlert = false
+    @State private var exportMessage = ""
+    
     // 添加一个强制刷新的方法
     private func reloadAlbums() {
         appLog("AlbumsListView: 开始重新加载相册列表")
-        // 在后台线程获取数据
-        DispatchQueue.global(qos: .userInitiated).async {
-            let dbAlbums = DatabaseManager.shared.getAllAlbums()
-            appLog("AlbumsListView: 从数据库获取到 \(dbAlbums.count) 个相册")
-            
-            // 打印每个相册的详细信息（数据库数据）
-            for (index, album) in dbAlbums.enumerated() {
-                appLog("AlbumsListView: 数据库数据[\(index)] - ID: \(album.id.uuidString), 名称: \(album.name), 照片数量: \(album.count)")
-            }
-            
-            // 在主线程更新 UI
-            DispatchQueue.main.async {
-                // 直接使用数据库返回的数组，不做任何转换
-                self.albums = dbAlbums
+        // 修复：添加防抖机制，避免频繁重载导致UI异常
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            // 在后台线程获取数据
+            DispatchQueue.global(qos: .userInitiated).async {
+                let dbAlbums = DatabaseManager.shared.getAllAlbums()
+                appLog("AlbumsListView: 从数据库获取到 \(dbAlbums.count) 个相册")
                 
-                // 打印赋值后的数据
-                appLog("AlbumsListView: UI更新后的相册数量: \(self.albums.count)")
-                for (index, album) in self.albums.enumerated() {
-                    appLog("AlbumsListView: UI数据[\(index)] - ID: \(album.id.uuidString), 名称: \(album.name), 照片数量: \(album.count)")
+                // 打印每个相册的详细信息（数据库数据）
+                for (index, album) in dbAlbums.enumerated() {
+                    appLog("AlbumsListView: 数据库数据[\(index)] - ID: \(album.id.uuidString), 名称: \(album.name), 照片数量: \(album.count)")
                 }
                 
-                // 添加详细日志
-                appLog("AlbumsListView: 强制刷新后加载了 \(self.albums.count) 个相册")
-                for album in self.albums {
-                    appLog("AlbumsListView: 刷新后 - 相册 '\(album.name)' 包含 \(album.count) 张照片")
+                // 在主线程更新 UI
+                DispatchQueue.main.async {
+                    // 直接使用数据库返回的数组，不做任何转换
+                    self.albums = dbAlbums
+                    
+                    // 打印赋值后的数据
+                    appLog("AlbumsListView: UI更新后的相册数量: \(self.albums.count)")
+                    for (index, album) in self.albums.enumerated() {
+                        appLog("AlbumsListView: UI数据[\(index)] - ID: \(album.id.uuidString), 名称: \(album.name), 照片数量: \(album.count)")
+                    }
+                    
+                    // 添加详细日志
+                    appLog("AlbumsListView: 强制刷新后加载了 \(self.albums.count) 个相册")
+                    for album in self.albums {
+                        appLog("AlbumsListView: 刷新后 - 相册 '\(album.name)' 包含 \(album.count) 张照片")
+                    }
                 }
             }
         }
@@ -97,7 +107,7 @@ struct AlbumsListView: View {
                                             .font(.system(size: 40))
                                             .foregroundColor(.blue)
                                         
-                                        Text("创建新相册")
+                                        Text("Create New Photo Album")
                                             .font(.headline)
                                             .foregroundColor(.blue)
                                     }
@@ -118,11 +128,11 @@ struct AlbumsListView: View {
                                 .font(.system(size: 50))
                                 .foregroundColor(.gray)
                             
-                            Text("还没有相册")
+                            Text("No Photo Albums Yet")
                                 .font(.headline)
                                 .foregroundColor(.gray)
                             
-                            Text("点击右上角的"+"按钮创建一个新相册")
+                            Text("Click the '+' button in the top right corner to create a new photo album")
                                 .font(.subheadline)
                                 .foregroundColor(.gray)
                                 .multilineTextAlignment(.center)
@@ -130,9 +140,9 @@ struct AlbumsListView: View {
                         }
                         .padding(.top, 50)
                     } else {
-                        ForEach(albums) { album in
-                            albumRow(album: album) // 使用重构的行视图
-                        }
+                                            ForEach(Array(albums.enumerated()), id: \.element.id) { index, album in
+                        albumRow(album: album, index: index) // 传递索引以判断是否被锁定
+                    }
                     }
                 }
                 .padding(.vertical)
@@ -146,42 +156,88 @@ struct AlbumsListView: View {
             }
             .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
             .onAppear {
-                // 每次进入页面时强制从数据库重新加载相册数据
-                appLog("AlbumsListView: onAppear 强制刷新相册列表")
-                reloadAlbums()
+                // 修复：只在真正需要时重新加载相册列表，避免频繁重载导致UI问题
+                // 不要每次onAppear都重载，这会与PhotoGridView的操作产生冲突
+                if albums.isEmpty {
+                    appLog("AlbumsListView: onAppear - 相册列表为空，执行初始加载")
+                    reloadAlbums()
+                } else {
+                    appLog("AlbumsListView: onAppear - 相册列表不为空(\(albums.count)个)，跳过重载")
+                }
             }
             .onReceive(NotificationCenter.default.publisher(for: .didUpdateAlbumList)) { _ in
                 appLog("AlbumsListView: Received didUpdateAlbumList notification. Reloading albums.")
-                // 收到通知后重新加载相册数据
-                reloadAlbums()
+                // 修复：添加延迟，避免在照片导入过程中立即重载造成冲突
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    appLog("AlbumsListView: 延迟处理通知，开始重新加载相册列表")
+                    self.reloadAlbums()
+                }
             }
-            .alert(isPresented: $showingDeleteAlert) { // 单个删除确认 - 移除外部标题
+            .alert(isPresented: $showingDeleteAlert) { // Single delete confirmation
                 Alert(
-                    title: Text("删除相册"),
-                    message: Text("确定要删除相册\"\(albumToDelete?.name ?? "")\"吗？此操作将同时删除相册内的所有照片，且不可恢复。"),
-                    primaryButton: .destructive(Text("删除")) {
+                                title: Text("Delete Photo Album"),
+            message: Text("Are you sure you want to delete photo album \"\(albumToDelete?.name ?? "")\"? This will also delete all photos in the album and cannot be undone."),
+                    primaryButton: .destructive(Text("Delete")) {
                         if let album = albumToDelete {
                             performDelete(album)
                         }
                     },
-                    secondaryButton: .cancel(Text("取消")) {
-                         albumToDelete = nil // 清理
+                    secondaryButton: .cancel(Text("Cancel")) {
+                         albumToDelete = nil // Clean up
                     }
                 )
             }
-            .alert("删除所选相册?", isPresented: $showingMultiDeleteAlert) { // 批量删除确认
-                 Button("删除", role: .destructive) {
-                     deleteSelectedAlbums()
-                 }
-                 Button("取消", role: .cancel) {}
-             } message: {
-                 Text("确定要删除选中的 \(selectedAlbumIDs.count) 个相册吗？此操作将同时删除相册内的所有照片，且不可恢复。")
-             }
+                    .alert("Delete Selected Photo Albums?", isPresented: $showingMultiDeleteAlert) { // Batch delete confirmation
+            Button("Delete", role: .destructive) {
+                deleteSelectedAlbums()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Are you sure you want to delete the selected \(selectedAlbumIDs.count) photo albums? This will also delete all photos in the albums and cannot be undone.")
+        }
+            .actionSheet(isPresented: $showingExportSheet) {
+                ActionSheet(
+                    title: Text("Premium Photo Album"),
+                    message: Text("This photo album requires premium membership to view. You can export photos to system album or renew membership to continue using."),
+                    buttons: [
+                        .default(Text("Export to System Album")) {
+                            if let album = albumToExport {
+                                exportAlbumToPhotos(album)
+                            }
+                        },
+                        .default(Text("Renew Membership")) {
+                            // Navigate to membership purchase page
+                            // Add navigation logic here
+                        },
+                        .cancel(Text("Cancel")) {
+                            albumToExport = nil
+                        }
+                    ]
+                )
+            }
+            .alert("Export Result", isPresented: $showingExportAlert) {
+                if exportMessage.contains("Successfully exported") {
+                    Button("Confirm Removal") {
+                        if let album = albumToExport {
+                            removeExportedAlbum(album)
+                        }
+                    }
+                    Button("Cancel", role: .cancel) {
+                        albumToExport = nil
+                    }
+                } else {
+                    Button("OK", role: .cancel) {
+                        albumToExport = nil
+                    }
+                }
+            } message: {
+                Text(exportMessage)
+            }
             .toolbar { // 底部多选删除工具栏
                  ToolbarItemGroup(placement: .bottomBar) {
                      if isSelectionMode {
                          Spacer()
-                         Button("删除 (\(selectedAlbumIDs.count))") {
+                         Button("Delete (\(selectedAlbumIDs.count))") {
                              if !selectedAlbumIDs.isEmpty {
                                   showingMultiDeleteAlert = true
                              }
@@ -198,7 +254,7 @@ struct AlbumsListView: View {
     
     // 重构的相册行视图
     @ViewBuilder
-    private func albumRow(album: Album) -> some View {
+    private func albumRow(album: Album, index: Int) -> some View {
         HStack {
             // 选择模式下的勾选框
             if isSelectionMode {
@@ -214,19 +270,28 @@ struct AlbumsListView: View {
             // AlbumCard 或 NavigationLink
             Group {
                  if isSelectionMode {
-                     AlbumCard(album: album)
+                     AlbumCard(album: album, isLocked: isAlbumLocked(index: index))
                          .onTapGesture {
                              toggleSelection(for: album)
                          }
                  } else {
-                     NavigationLink(destination: {
-                         // 在创建PhotoGridView前打印相册信息
-                         let _ = appLog("AlbumsListView: NavigationLink创建PhotoGridView - 相册'\(album.name)'包含\(album.count)张照片")
-                         return PhotoGridView(album: album)
-                     }()) {
-                         AlbumCard(album: album)
+                     if isAlbumLocked(index: index) {
+                         // 锁定的相册不能进入，只能进行移出操作
+                         AlbumCard(album: album, isLocked: true)
+                             .onTapGesture {
+                                 showExportOptions(for: album)
+                             }
+                     } else {
+                         // 正常相册可以进入查看
+                         NavigationLink(destination: {
+                             // 在创建PhotoGridView前打印相册信息
+                             let _ = appLog("AlbumsListView: NavigationLink创建PhotoGridView - 相册'\(album.name)'包含\(album.count)张照片")
+                             return PhotoGridView(album: album)
+                         }()) {
+                             AlbumCard(album: album, isLocked: false)
+                         }
+                         .buttonStyle(PlainButtonStyle())
                      }
-                     .buttonStyle(PlainButtonStyle())
                  }
             }
             .contentShape(Rectangle()) // 让空白区域也能触发手势
@@ -241,7 +306,7 @@ struct AlbumsListView: View {
                      Button(role: .destructive) {
                          deleteAlbumConfirmation(album) // 触发单个删除确认
                      } label: {
-                         Label("删除相册", systemImage: "trash")
+                         Label("Delete Photo Album", systemImage: "trash")
                      }
                  }
             }
@@ -250,7 +315,7 @@ struct AlbumsListView: View {
                  Button(role: .destructive) {
                      deleteAlbumConfirmation(album) // 触发单个删除确认
                  } label: {
-                     Label("删除", systemImage: "trash")
+                     Label("Delete", systemImage: "trash")
                  }
              }
         }
@@ -262,13 +327,13 @@ struct AlbumsListView: View {
     // MARK: - Navigation Bar Items
     
     private var navigationTitle: String {
-        isSelectionMode ? "已选择 \(selectedAlbumIDs.count) 项" : "隐私相册"
+        isSelectionMode ? "Selected \(selectedAlbumIDs.count) items" : "Private Photo Albums"
     }
 
     private var leadingNavigationButton: some View {
         Group {
             if isSelectionMode {
-                Button("取消") {
+                Button("Cancel") {
                     exitSelectionMode()
                 }
             } else {
@@ -285,7 +350,7 @@ struct AlbumsListView: View {
             } else {
                 // 非选择模式下显示 "选择" 和 "+"
                  HStack {
-                    Button("选择") {
+                    Button("Select") {
                         enterSelectionMode()
                     }
                      
@@ -300,6 +365,23 @@ struct AlbumsListView: View {
     }
     
     // MARK: - Actions & Logic
+    
+    // 判断相册是否被锁定
+    private func isAlbumLocked(index: Int) -> Bool {
+        // 如果是会员，所有相册都不锁定
+        if storeManager.isMember {
+            return false
+        }
+        
+        // 非会员用户：第2个及以后的相册被锁定
+        return index >= 1
+    }
+    
+    // 显示移出选项
+    private func showExportOptions(for album: Album) {
+        albumToExport = album
+        showingExportSheet = true
+    }
     
     // 进入选择模式
     private func enterSelectionMode(selecting album: Album? = nil) {
@@ -334,7 +416,7 @@ struct AlbumsListView: View {
     // 执行单个删除操作
     private func performDelete(_ album: Album) {
         // 从数据库中删除
-        if DatabaseManager.shared.deleteAlbum(id: album.id) {
+        if DatabaseManager.shared.deleteAlbum(withId: album.id) {
             // 更新UI
             if let index = albums.firstIndex(where: { $0.id == album.id }) {
                 albums.remove(at: index)
@@ -354,7 +436,7 @@ struct AlbumsListView: View {
          appLog("Attempting to delete \(idsToDelete.count) selected albums.")
 
          for albumId in idsToDelete {
-             if DatabaseManager.shared.deleteAlbum(id: albumId) {
+             if DatabaseManager.shared.deleteAlbum(withId: albumId) {
                  deletedCount += 1
                  appLog("Successfully deleted album with ID: \(albumId)")
              } else {
@@ -368,6 +450,87 @@ struct AlbumsListView: View {
          // 移除已删除的相册并退出选择模式
          albums.removeAll { idsToDelete.contains($0.id) }
          exitSelectionMode() // 退出选择模式并清空 selectedAlbumIDs
+    }
+    
+    // 导出相册到系统相册
+    private func exportAlbumToPhotos(_ album: Album) {
+        appLog("Start exporting album '\(album.name)' to system photos")
+        
+        Task {
+            do {
+                // 获取相册中的所有照片
+                let photos = PhotoManager.shared.getPhotos(fromAlbum: album.id)
+                var exportedCount = 0
+                var failedCount = 0
+                
+                for photo in photos {
+                    do {
+                        // 获取照片的完整路径
+                        guard let photoURL = photo.imagePath else {
+                            failedCount += 1
+                            appLog("Unable to get photo path: \(photo.fileName)")
+                            continue
+                        }
+                        
+                        // 检查文件是否存在
+                        if FileManager.default.fileExists(atPath: photoURL.path) {
+                            let imageData = try Data(contentsOf: photoURL)
+                            if let uiImage = UIImage(data: imageData) {
+                                // 保存到系统相册
+                                try await PhotoManager.shared.saveImageToPhotos(uiImage)
+                                exportedCount += 1
+                                appLog("Successfully exported photo: \(photo.fileName)")
+                            } else {
+                                failedCount += 1
+                                appLog("Unable to create UIImage: \(photo.fileName)")
+                            }
+                        } else {
+                            failedCount += 1
+                            appLog("Photo file does not exist: \(photoURL.path)")
+                        }
+                    } catch {
+                        failedCount += 1
+                        appLog("Failed to export photo: \(photo.fileName), error: \(error)")
+                    }
+                }
+                
+                // 导出完成后的处理
+                DispatchQueue.main.async {
+                    if exportedCount > 0 {
+                        self.exportMessage = "Successfully exported \(exportedCount) photos to system album"
+                        if failedCount > 0 {
+                            self.exportMessage += ", \(failedCount) photos failed to export"
+                        }
+                        self.exportMessage += ". The album will be removed from the app."
+                        
+                        // 显示成功提示，询问是否删除相册
+                        self.showingExportAlert = true
+                    } else {
+                        self.exportMessage = "Failed to export album, please try again later."
+                        self.showingExportAlert = true
+                    }
+                }
+                
+            } catch {
+                DispatchQueue.main.async {
+                    self.exportMessage = "An error occurred while exporting the album: \(error.localizedDescription)"
+                    self.showingExportAlert = true
+                }
+            }
+        }
+    }
+    
+    // 完成导出后删除相册
+    private func removeExportedAlbum(_ album: Album) {
+        // 删除相册及其所有照片
+        if DatabaseManager.shared.deleteAlbum(withId: album.id) {
+            // 更新UI
+            if let index = albums.firstIndex(where: { $0.id == album.id }) {
+                albums.remove(at: index)
+                appLog("Deleted exported album: \(album.name)")
+            }
+        }
+        albumToExport = nil
     }
 }
 
@@ -398,11 +561,13 @@ struct Album: Identifiable, Equatable {
 
 struct AlbumCard: View {
     let album: Album
+    let isLocked: Bool
     @Environment(\.colorScheme) var colorScheme
     
-    init(album: Album) {
+    init(album: Album, isLocked: Bool = false) {
         self.album = album
-        appLog("AlbumCard: 创建相册卡片 '\(album.name)'，显示照片数量: \(album.count)")
+        self.isLocked = isLocked
+        appLog("AlbumCard: 创建相册卡片 '\(album.name)'，显示照片数量: \(album.count)，锁定状态: \(isLocked)")
     }
     
     var body: some View {
@@ -412,6 +577,13 @@ struct AlbumCard: View {
                       Color(UIColor.systemGray6) : Color.white)
                 .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.3 : 0.1), 
                         radius: 8, x: 0, y: 2)
+                .opacity(isLocked ? 0.7 : 1.0)
+            
+            // 锁定遮罩层
+            if isLocked {
+                RoundedRectangle(cornerRadius: 15)
+                    .fill(Color.black.opacity(0.3))
+            }
             
             HStack {
                 // 封面图
@@ -441,7 +613,7 @@ struct AlbumCard: View {
                         .foregroundColor(colorScheme == .dark ? .white : .black)
                     
                     HStack {
-                        Text("\(album.count) 张照片")
+                        Text("\(album.count) photos")
                             .id("count-\(album.id)-\(album.count)")
                             .font(.subheadline)
                             .foregroundColor(.gray)
@@ -457,9 +629,21 @@ struct AlbumCard: View {
                 
                 Spacer()
                 
-                Image(systemName: "chevron.right")
-                    .foregroundColor(.gray)
-                    .padding(.trailing, 5)
+                if isLocked {
+                    VStack(spacing: 2) {
+                        Image(systemName: "lock.fill")
+                            .font(.system(size: 16))
+                            .foregroundColor(.yellow)
+                        Text("Premium")
+                            .font(.caption2)
+                            .foregroundColor(.yellow)
+                    }
+                    .padding(.trailing, 8)
+                } else {
+                    Image(systemName: "chevron.right")
+                        .foregroundColor(.gray)
+                        .padding(.trailing, 5)
+                }
             }
             .padding()
         }
@@ -477,37 +661,62 @@ struct CreateAlbumView: View {
     @Environment(\.presentationMode) var presentationMode
     var onAlbumCreated: (Album) -> Void
     @State private var albumName = ""
+    @State private var showMembershipAlert = false
+    @ObservedObject private var storeManager = StoreKitManager.shared
     
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("相册信息")) {
-                    TextField("相册名称", text: $albumName)
+                Section(header: Text("Album Information")) {
+                    TextField("Album Name", text: $albumName)
                 }
             }
-            .navigationTitle("创建新相册")
+            .navigationTitle("Create New Photo Album")
             .navigationBarItems(
-                leading: Button("取消") {
+                leading: Button("Cancel") {
                     presentationMode.wrappedValue.dismiss()
                 },
-                trailing: Button("创建") {
+                trailing: Button("Create") {
                     if !albumName.isEmpty {
-                        let newAlbum = Album(
-                            name: albumName,
-                            coverImage: "",
-                            count: 0,
-                            createdAt: Date()
-                        )
-                        
-                        // 保存到数据库
-                        if DatabaseManager.shared.saveAlbum(newAlbum) {
-                            onAlbumCreated(newAlbum)
-                            presentationMode.wrappedValue.dismiss()
+                        // 如果是会员或者相册数量小于1，允许创建
+                        if storeManager.isMember || DatabaseManager.shared.getAllAlbums().count < 1 {
+                            let newAlbum = Album(
+                                name: albumName,
+                                coverImage: "",
+                                count: 0,
+                                createdAt: Date()
+                            )
+                            
+                            // 保存到数据库
+                            if DatabaseManager.shared.saveAlbum(newAlbum) {
+                                onAlbumCreated(newAlbum)
+                                presentationMode.wrappedValue.dismiss()
+                            }
+                        } else {
+                            // Non-member with existing album, show membership alert
+                            showMembershipAlert = true
                         }
                     }
                 }
                 .disabled(albumName.isEmpty)
             )
+            .alert(isPresented: $showMembershipAlert) {
+                Alert(
+                    title: Text("Membership Limitation"),
+                    message: Text("Free users can only create one album. Upgrade to premium to create unlimited albums."),
+                    primaryButton: .default(Text("Upgrade to Premium")) {
+                        // Navigate to membership purchase page
+                        presentationMode.wrappedValue.dismiss()
+                    },
+                    secondaryButton: .cancel(Text("Cancel"))
+                )
+            }
+            .onAppear {
+                // Update membership status on initialization
+                Task {
+                    await storeManager.forceUpdatePurchasedProducts()
+                }
+            }
         }
     }
 }
@@ -515,36 +724,42 @@ struct CreateAlbumView: View {
 struct ProfileView: View {
     @Environment(\.colorScheme) var colorScheme
     @State private var showingPasswordSettings = false
-    @State private var storageSize: String = "计算中..."
+    @State private var showingMembership = false
+    @State private var showingPrivacyPolicy = false
+    @State private var storageSize: String = "Calculating..."
+    @ObservedObject private var storeManager = StoreKitManager.shared
+    @State private var showRestoreAlert = false
+    @State private var restoreAlertMessage = ""
+    @State private var restoreAlertTitle = ""
     
     var body: some View {
         NavigationView {
             VStack {
-                // 用户头像
+                // User avatar
                 Circle()
                     .fill(colorScheme == .dark ? 
                           Color(UIColor.systemGray5) : Color.gray.opacity(0.2))
                     .frame(width: 100, height: 100)
                     .overlay(
-                        Image(systemName: "person.fill")
+                        Image(systemName: storeManager.isMember ? "crown.fill" : "person.fill")
                             .font(.system(size: 50))
-                            .foregroundColor(colorScheme == .dark ? 
-                                             Color.gray.opacity(0.8) : .gray)
+                            .foregroundColor(storeManager.isMember ? .yellow : 
+                                             (colorScheme == .dark ? Color.gray.opacity(0.8) : .gray))
                     )
                     .shadow(color: Color.black.opacity(colorScheme == .dark ? 0.3 : 0.1), 
                             radius: 5, x: 0, y: 2)
                     .padding(.top, 30)
                 
-                Text("用户")
+                Text(storeManager.isMember ? "Premium User" : "Free User")
                     .font(.title)
                     .foregroundColor(colorScheme == .dark ? .white : .black)
                     .padding(.top, 8)
                 
-                // 选项列表
+                // Options list
                 List {
                     Section {
                         HStack {
-                            Label("存储空间", systemImage: "externaldrive.fill")
+                            Label("Photo Storage", systemImage: "photo.on.rectangle")
                             Spacer()
                             Text(storageSize)
                                 .foregroundColor(.gray)
@@ -554,71 +769,129 @@ struct ProfileView: View {
                             showingPasswordSettings = true
                         }) {
                             HStack {
-                                Label("计算器密码", systemImage: "lock.shield")
+                                Label("Calculator Password", systemImage: "lock.shield")
                                 Spacer()
                                 Image(systemName: "chevron.right")
                                     .foregroundColor(.gray)
                             }
                         }
+                        
+                        Button(action: {
+                            showingMembership = true
+                        }) {
+                            HStack {
+                                Label("Premium Service", systemImage: "crown.fill")
+                                Spacer()
+                                if storeManager.isMember {
+                                    Text("Active")
+                                        .foregroundColor(.green)
+                                        .font(.caption)
+                                }
+                                Image(systemName: "chevron.right")
+                                    .foregroundColor(.gray)
+                            }
+                        }
+                        
+                        // 恢复购买按钮 - 只在用户不是会员时显示
+                        if !storeManager.isMember {
+                            Button(action: {
+                                Task {
+                                    await restorePurchases()
+                                }
+                            }) {
+                                HStack {
+                                    Label("Restore Purchases", systemImage: "arrow.clockwise")
+                                    Spacer()
+                                    if storeManager.isRestoringPurchases {
+                                        ProgressView()
+                                            .progressViewStyle(CircularProgressViewStyle())
+                                            .scaleEffect(0.8)
+                                    }
+                                }
+                                .foregroundColor(storeManager.isRestoringPurchases ? .gray : (storeManager.isAppleIDSignedIn ? .blue : .gray))
+                            }
+                            .disabled(storeManager.isRestoringPurchases || !storeManager.isAppleIDSignedIn)
+                        }
                     }
                     
                     Section {
+                        Button(action: {
+                            showingPrivacyPolicy = true
+                        }) {
+                            HStack {
+                                Label("Privacy Policy", systemImage: "doc.text")
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .foregroundColor(.gray)
+                            }
+                        }
+                        .foregroundColor(.primary)
+                        
                         HStack {
-                            Label("关于", systemImage: "info.circle")
+                            Label("Version", systemImage: "info.circle")
                             Spacer()
-                            Image(systemName: "chevron.right")
+                            Text("1.0.0")
                                 .foregroundColor(.gray)
                         }
                     }
                 }
                 .listStyle(InsetGroupedListStyle())
             }
-            .navigationTitle("我的")
+            .navigationTitle("Profile")
             .background(colorScheme == .dark ? Color.black : Color(UIColor.systemGroupedBackground))
             .sheet(isPresented: $showingPasswordSettings) {
                 PasswordSettingsView()
             }
+            .sheet(isPresented: $showingMembership) {
+                MembershipView()
+            }
+            .sheet(isPresented: $showingPrivacyPolicy) {
+                PrivacyPolicyView()
+            }
+            .alert(restoreAlertTitle, isPresented: $showRestoreAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(restoreAlertMessage)
+            }
             .onAppear {
                 calculateStorageSize()
+                // Update membership status
+                Task {
+                    await storeManager.forceUpdatePurchasedProducts()
+                }
+            }
+            .onReceive(storeManager.$restoreSuccess) { success in
+                if success {
+                    restoreAlertTitle = "Restore Successful"
+                    restoreAlertMessage = "Your purchase has been successfully restored, you can now enjoy all premium features."
+                    showRestoreAlert = true
+                    storeManager.restoreSuccess = false
+                }
+            }
+            .onReceive(storeManager.$restoreError) { error in
+                if let error = error {
+                    restoreAlertTitle = "Restore Failed"
+                    restoreAlertMessage = error
+                    showRestoreAlert = true
+                    storeManager.restoreError = nil
+                }
             }
         }
+    }
+    
+    private func restorePurchases() async {
+        print("ProfileView: Starting restore purchases...")
+        await storeManager.restorePurchases()
     }
     
     private func calculateStorageSize() {
-        // 在后台线程计算存储空间
-        DispatchQueue.global(qos: .userInitiated).async {
-            let fileManager = FileManager.default
-            let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            let libraryPath = fileManager.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-            
-            var totalSize: UInt64 = 0
-            
-            // 计算 Documents 目录大小
-            if let documentsSize = try? fileManager.allocatedSizeOfDirectory(at: documentsPath) {
-                totalSize += documentsSize
-            }
-            
-            // 计算 Library 目录大小
-            if let librarySize = try? fileManager.allocatedSizeOfDirectory(at: libraryPath) {
-                totalSize += librarySize
-            }
-            
-            // 在主线程更新 UI
-            DispatchQueue.main.async {
-                self.storageSize = formatFileSize(totalSize)
-            }
-        }
-    }
-    
-    private func formatFileSize(_ size: UInt64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useMB, .useGB]
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: Int64(size))
+        let albums = DatabaseManager.shared.getAllAlbums()
+        let totalPhotos = albums.reduce(0) { $0 + $1.count }
+        storageSize = "\(totalPhotos) photos"
     }
 }
 
-// 扩展 FileManager 以计算目录大小
+// Extend FileManager to calculate directory size
 extension FileManager {
     func allocatedSizeOfDirectory(at url: URL) throws -> UInt64 {
         var totalSize: UInt64 = 0
