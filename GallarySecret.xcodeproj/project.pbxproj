@@ -11,9 +11,22 @@
 		AE5C6EFD2DA7F485000D14CA /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		AE421E7A2E2941FC00033F3A /* Exceptions for "GallarySecret" folder in "GallarySecret" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = AE5C6EE42DA7E655000D14CA /* GallarySecret */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		AE5C6EE72DA7E655000D14CA /* GallarySecret */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				AE421E7A2E2941FC00033F3A /* Exceptions for "GallarySecret" folder in "GallarySecret" target */,
+			);
 			path = GallarySecret;
 			sourceTree = "<group>";
 		};
@@ -266,6 +279,7 @@
 				DEVELOPMENT_TEAM = 24D88Q3K3S;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = GallarySecret/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "隐私计算器";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "需要访问您的相册来导入照片到私密相册";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -300,6 +314,7 @@
 				DEVELOPMENT_TEAM = 24D88Q3K3S;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = GallarySecret/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "隐私计算器";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "需要访问您的相册来导入照片到私密相册";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
