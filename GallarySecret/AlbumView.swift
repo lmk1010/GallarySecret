@@ -2,30 +2,37 @@ import SwiftUI
 
 struct MainView: View {
     @State private var selectedTab = 0
+    @State private var isAuthenticated = false
     
     var body: some View {
-        TabView(selection: $selectedTab) {
-            AlbumsListView()
-                .tabItem {
-                    Image(systemName: "photo.on.rectangle.angled")
-                    Text("Albums")
-                }
-                .tag(0)
-            
-            ProfileView()
-                .tabItem {
-                    Image(systemName: "person.circle")
-                    Text("Profile")
-                }
-                .tag(1)
-        }
-        .accentColor(.blue)
-        .onChange(of: selectedTab) { newValue in
-            // 当切换到相册选项卡时发送通知以刷新相册列表
-            if newValue == 0 {
-                appLog("MainView: Tab changed to Albums. Posting notification to refresh album list.")
-                NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+        if isAuthenticated {
+            TabView(selection: $selectedTab) {
+                AlbumsListView()
+                    .tabItem {
+                        Image(systemName: "photo.on.rectangle.angled")
+                        Text("Albums")
+                    }
+                    .tag(0)
+                
+                ProfileView()
+                    .tabItem {
+                        Image(systemName: "person.circle")
+                        Text("Profile")
+                    }
+                    .tag(1)
             }
+            .accentColor(.blue)
+            .onChange(of: selectedTab) { newValue in
+                // 当切换到相册选项卡时发送通知以刷新相册列表
+                if newValue == 0 {
+                    appLog("MainView: Tab changed to Albums. Posting notification to refresh album list.")
+                    NotificationCenter.default.post(name: .didUpdateAlbumList, object: nil)
+                }
+            }
+        } else {
+            SecurityVerificationView(onAuthenticated: {
+                isAuthenticated = true
+            })
         }
     }
 }
@@ -916,4 +923,4 @@ extension FileManager {
 
 #Preview {
     MainView()
-} 
+}

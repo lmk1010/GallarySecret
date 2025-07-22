@@ -50,7 +50,7 @@ struct GallarySecretApp: App {
     
     var body: some Scene {
         WindowGroup {
-            CalculatorView()
+            MainView()
                 .onAppear {
                     // 应用启动时初始化StoreKit并检查购买状态
                     Task {
